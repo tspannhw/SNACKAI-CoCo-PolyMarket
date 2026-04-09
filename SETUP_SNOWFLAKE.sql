@@ -54,6 +54,10 @@ CREATE SCHEMA IF NOT EXISTS POLYMARKET.STREAMING
 USE DATABASE POLYMARKET;
 USE SCHEMA STREAMING;
 
+-- Enable ROW_TIMESTAMP_DEFAULT so all new tables automatically get
+-- METADATA$ROW_LAST_COMMIT_TIME tracking (Snowflake Feb 2026 feature).
+ALTER SCHEMA POLYMARKET.STREAMING SET ROW_TIMESTAMP_DEFAULT = TRUE;
+
 
 -- ============================================================
 -- SECTION 2: TABLES
@@ -134,7 +138,8 @@ CREATE OR REPLACE TABLE POLYMARKET.STREAMING.MARKETS (
                                           COMMENT 'When this row was streamed to Snowflake',
     batch_id              VARCHAR(100)    COMMENT 'Ingestion batch identifier (batch_YYYYMMDD_HHMMSS_xxxxxxxx)'
 )
-COMMENT = 'Polymarket prediction market data. Append-only via SSv2. Use V_LATEST_MARKETS for current state.';
+COMMENT = 'Polymarket prediction market data. Append-only via SSv2. Use V_LATEST_MARKETS for current state.'
+ROW_TIMESTAMP = TRUE;
 
 
 -- ------------------------------------------------------------
@@ -169,7 +174,8 @@ CREATE OR REPLACE TABLE POLYMARKET.STREAMING.MARKET_EVENTS (
                                           COMMENT 'When this row was ingested',
     batch_id              VARCHAR(100)    COMMENT 'Ingestion batch identifier'
 )
-COMMENT = 'Polymarket events (parent groupings of related markets). Reserved for future streaming.';
+COMMENT = 'Polymarket events (parent groupings of related markets). Reserved for future streaming.'
+ROW_TIMESTAMP = TRUE;
 
 
 -- ------------------------------------------------------------
@@ -202,11 +208,12 @@ CREATE OR REPLACE TABLE POLYMARKET.STREAMING.INGESTION_METRICS (
     ingested_at           TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP()
                                           COMMENT 'When this metrics row was written'
 )
-COMMENT = 'Pipeline ingestion metrics. One row per batch. Feeds V_INGESTION_HEALTH dashboard view.';
+COMMENT = 'Pipeline ingestion metrics. One row per batch. Feeds V_INGESTION_HEALTH dashboard view.'
+ROW_TIMESTAMP = TRUE;
 
 
 -- ============================================================
--- SECTION 3: GRANTS
+-- SECTION 3: GRANTS AND ACCESS
 -- ============================================================
 -- Grant access to ACCOUNTADMIN. Adjust roles as needed for your
 -- environment. For production, create a dedicated role:
@@ -214,11 +221,88 @@ COMMENT = 'Pipeline ingestion metrics. One row per batch. Feeds V_INGESTION_HEAL
 --   GRANT USAGE ON DATABASE POLYMARKET TO ROLE POLYMARKET_READER;
 --   GRANT USAGE ON SCHEMA POLYMARKET.STREAMING TO ROLE POLYMARKET_READER;
 --   GRANT SELECT ON ALL VIEWS IN SCHEMA POLYMARKET.STREAMING TO ROLE POLYMARKET_READER;
+--
+-- NOTE on SSv2 Default Pipes:
+--   The default auto-created pipes (e.g. MARKETS-STREAMING) are
+--   Snowflake-managed (is_snowflake_managed=true, owner=NULL).
+--   GRANT MONITOR/OPERATE is NOT supported on managed pipes.
+--   ACCOUNTADMIN can already see them via:
+--     SHOW PIPES IN SCHEMA POLYMARKET.STREAMING;
+--   And monitor channel activity via:
+--     SNOWFLAKE.ACCOUNT_USAGE.SNOWPIPE_STREAMING_CHANNEL_HISTORY
 -- ============================================================
 
 GRANT USAGE ON DATABASE POLYMARKET TO ROLE ACCOUNTADMIN;
 GRANT USAGE ON SCHEMA POLYMARKET.STREAMING TO ROLE ACCOUNTADMIN;
 GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA POLYMARKET.STREAMING TO ROLE ACCOUNTADMIN;
+-- Grant access to ACCOUNT_USAGE for channel monitoring
+GRANT IMPORTED PRIVILEGES ON DATABASE SNOWFLAKE TO ROLE ACCOUNTADMIN;
+
+
+-- ============================================================
+-- SECTION 3b: ENABLE ROW TIMESTAMPS ON EXISTING TABLES
+-- ============================================================
+-- ROW_TIMESTAMP enables METADATA$ROW_LAST_COMMIT_TIME on each table,
+-- which tracks when each row was last committed. Useful for:
+--   - Measuring ingestion latency (SSv2 commit time vs client timestamp)
+--   - Change tracking and incremental processing
+--   - Time-travel queries based on row modification time
+--
+-- The schema-level ROW_TIMESTAMP_DEFAULT (set above) ensures new tables
+-- get this automatically. These ALTER statements enable it on tables
+-- that were created before the schema default was set.
+-- ============================================================
+
+ALTER TABLE POLYMARKET.STREAMING.MARKETS SET ROW_TIMESTAMP = TRUE;
+ALTER TABLE POLYMARKET.STREAMING.MARKET_EVENTS SET ROW_TIMESTAMP = TRUE;
+ALTER TABLE POLYMARKET.STREAMING.INGESTION_METRICS SET ROW_TIMESTAMP = TRUE;
+
+
+-- ============================================================
+-- SECTION 3c: ENABLE ERROR LOGGING FOR SSv2 STREAMING
+-- ============================================================
+-- ERROR_LOGGING captures failed rows from Snowpipe Streaming v2
+-- into dedicated error tables. When a row fails server-side
+-- validation (schema mismatch, type errors, constraint violations),
+-- it is logged with full payload and error metadata instead of
+-- being silently dropped.
+--
+-- GA as of April 8, 2026.
+-- Reference: https://docs.snowflake.com/en/release-notes/2026/other/2026-04-08-snowpipe-streaming-error-tables
+--
+-- Error tables are auto-created by Snowflake when errors occur.
+-- Query them via: SELECT * FROM TABLE(INFORMATION_SCHEMA.STREAMING_ERROR_LOG('MARKETS'));
+-- Or check SNOWPIPE_STREAMING_CHANNEL_HISTORY for ROW_ERROR_COUNT.
+-- ============================================================
+
+ALTER TABLE POLYMARKET.STREAMING.MARKETS SET ERROR_LOGGING = TRUE;
+ALTER TABLE POLYMARKET.STREAMING.MARKET_EVENTS SET ERROR_LOGGING = TRUE;
+ALTER TABLE POLYMARKET.STREAMING.INGESTION_METRICS SET ERROR_LOGGING = TRUE;
+
+
+-- ============================================================
+-- SECTION 3d: STREAMING CHANNEL MONITORING VIEW
+-- ============================================================
+-- Provides a convenient view over SNOWPIPE_STREAMING_CHANNEL_HISTORY
+-- for monitoring channel health, errors, and latency.
+-- ============================================================
+
+CREATE OR REPLACE VIEW POLYMARKET.STREAMING.V_STREAMING_CHANNEL_HEALTH AS
+SELECT
+    CHANNEL_NAME,
+    PIPE_NAME,
+    TABLE_NAME,
+    ROWS_INSERTED,
+    ROWS_PARSED,
+    ROW_ERROR_COUNT,
+    LAST_ERROR_MESSAGE,
+    LAST_ERROR_OFFSET_UPPER_BOUND,
+    SNOWFLAKE_PROCESSING_LATENCY_MS,
+    CREATED_ON
+FROM SNOWFLAKE.ACCOUNT_USAGE.SNOWPIPE_STREAMING_CHANNEL_HISTORY
+WHERE TABLE_DATABASE_NAME = 'POLYMARKET'
+  AND TABLE_SCHEMA_NAME = 'STREAMING'
+ORDER BY CREATED_ON DESC;
 
 
 -- ============================================================
@@ -368,6 +452,36 @@ UNION ALL
 SELECT 'V_INGESTION_HEALTH',                   COUNT(*) FROM POLYMARKET.STREAMING.V_INGESTION_HEALTH;
 
 
+-- 5f. Verify SSv2 default pipes are visible
+SHOW PIPES IN SCHEMA POLYMARKET.STREAMING;
+
+-- 5g. Check streaming channel history (errors, latency, rows)
+SELECT
+    CHANNEL_NAME,
+    PIPE_NAME,
+    TABLE_NAME,
+    ROWS_INSERTED,
+    ROWS_PARSED,
+    ROW_ERROR_COUNT,
+    LAST_ERROR_MESSAGE,
+    SNOWFLAKE_PROCESSING_LATENCY_MS,
+    CREATED_ON
+FROM SNOWFLAKE.ACCOUNT_USAGE.SNOWPIPE_STREAMING_CHANNEL_HISTORY
+WHERE TABLE_DATABASE_NAME = 'POLYMARKET'
+ORDER BY CREATED_ON DESC
+LIMIT 20;
+
+-- 5h. Check channel health monitoring view
+SELECT * FROM POLYMARKET.STREAMING.V_STREAMING_CHANNEL_HEALTH
+LIMIT 10;
+
+-- 5i. Verify ERROR_LOGGING is enabled (should return rows after errors occur)
+-- Error tables are auto-created when streaming errors are captured.
+-- If no errors have occurred yet, this returns 0 rows (expected).
+SELECT 'MARKETS errors' AS check_name, COUNT(*) AS error_rows
+FROM TABLE(POLYMARKET.INFORMATION_SCHEMA.STREAMING_ERROR_LOG('STREAMING.MARKETS'));
+
+
 -- ============================================================
 -- SECTION 6: DATA EXPLORATION QUERIES
 -- ============================================================
@@ -483,4 +597,23 @@ LIMIT 10;
 --   3. Start streaming:  ./manage.sh stream
 --   4. Start dashboard:  ./manage.sh start
 --   5. Run validation queries above to verify data flow
+--
+-- Components created:
+--   TABLES (3): MARKETS, MARKET_EVENTS, INGESTION_METRICS
+--   VIEWS  (5): V_LATEST_MARKETS, V_ACTIVE_MARKETS,
+--               V_MARKET_VOLUME_SUMMARY, V_INGESTION_HEALTH,
+--               V_STREAMING_CHANNEL_HEALTH
+--
+-- Features enabled:
+--   ROW_TIMESTAMP = TRUE        (all tables)
+--   ROW_TIMESTAMP_DEFAULT = TRUE (schema-level for new tables)
+--   ERROR_LOGGING = TRUE        (all tables, captures failed SSv2 rows)
+--
+-- SSv2 Default Pipes (Snowflake-managed, auto-created):
+--   MARKETS-STREAMING
+--   INGESTION_METRICS-STREAMING
+--
+-- Monitoring:
+--   V_STREAMING_CHANNEL_HEALTH  - Channel errors, latency, row counts
+--   SNOWPIPE_STREAMING_CHANNEL_HISTORY - Full account-usage history
 -- ============================================================

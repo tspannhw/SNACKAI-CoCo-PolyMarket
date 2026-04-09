@@ -4,7 +4,7 @@ import { useEffect, useState, useCallback } from 'react';
 import { StatCard } from './components/charts';
 import { VolumeByCategoryChart, IngestionHealthChart, CategoryPieChart } from './components/charts';
 import { MarketCard, MarketTable } from './components/market-cards';
-import { formatCurrency, formatNumber, timeAgo } from '@/lib/utils';
+import { formatCurrency, formatNumber, timeAgo, formatDateEST } from '@/lib/utils';
 
 interface DashboardData {
   markets: Array<Record<string, unknown>>;
@@ -24,6 +24,7 @@ export default function Dashboard() {
   const [viewMode, setViewMode] = useState<ViewMode>('cards');
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [lastUpdated, setLastUpdated] = useState<string>('');
+  const [refreshing, setRefreshing] = useState(false);
 
   const fetchData = useCallback(async () => {
     try {
@@ -86,6 +87,12 @@ export default function Dashboard() {
     }
   };
 
+  const handleRefresh = useCallback(async () => {
+    setRefreshing(true);
+    await fetchData();
+    setRefreshing(false);
+  }, [fetchData]);
+
   const totals = data?.streaming?.totals || {};
 
   // Determine pipeline status based on last ingestion timestamp
@@ -132,7 +139,7 @@ export default function Dashboard() {
             </div>
           </div>
           <p className="text-xs text-gray-500 mt-0.5">
-            Snowpipe Streaming v2 High-Performance | {timeAgo(lastUpdated)} | {formatNumber(data?.markets?.length || 0)} markets
+            Snowpipe Streaming v2 High-Performance | {formatDateEST()} | {formatNumber(data?.markets?.length || 0)} markets
           </p>
         </div>
         <div className="flex items-center gap-3">
@@ -160,10 +167,15 @@ export default function Dashboard() {
             </button>
           </div>
           <button
-            onClick={fetchData}
-            className="px-3 py-1.5 text-xs bg-gray-800 text-gray-300 rounded hover:bg-gray-700 transition-colors"
+            onClick={handleRefresh}
+            disabled={refreshing}
+            className={`px-3 py-1.5 text-xs rounded transition-colors ${
+              refreshing
+                ? 'bg-cyan-800 text-cyan-300 cursor-wait'
+                : 'bg-gray-800 text-gray-300 hover:bg-gray-700'
+            }`}
           >
-            Refresh
+            {refreshing ? 'Refreshing...' : 'Refresh'}
           </button>
         </div>
       </header>

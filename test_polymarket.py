@@ -6,7 +6,9 @@ Run: python -m pytest test_polymarket.py -v
 """
 
 import json
+import time
 import pytest
+import requests
 from datetime import datetime, timezone
 from unittest.mock import patch, MagicMock
 
@@ -368,6 +370,232 @@ class TestMetricsRow:
 
         # Should not raise
         stream_ingestion_metrics(mock_client, metrics)
+
+
+class TestStreamingClientRetry:
+    """Tests for SSv2 client retry, reopen, and token refresh logic."""
+
+    def _make_client(self):
+        """Create a SnowpipeStreamingClient with mocked config and auth."""
+        with patch('snowpipe_streaming_client.SnowflakeJWTAuth'):
+            with patch('builtins.open', MagicMock(
+                return_value=MagicMock(
+                    __enter__=MagicMock(return_value=MagicMock(
+                        read=MagicMock(return_value=json.dumps({
+                            'account': 'testorg-testacct',
+                            'user': 'TESTUSER',
+                            'database': 'TESTDB',
+                            'schema': 'TESTSCHEMA',
+                            'table': 'TESTTABLE',
+                            'pat': 'ver:1:test',
+                        }))
+                    )),
+                    __exit__=MagicMock(return_value=False),
+                )
+            )):
+                from snowpipe_streaming_client import SnowpipeStreamingClient
+                client = SnowpipeStreamingClient.__new__(SnowpipeStreamingClient)
+                client.config = {
+                    'account': 'testorg-testacct',
+                    'user': 'TESTUSER',
+                    'database': 'TESTDB',
+                    'schema': 'TESTSCHEMA',
+                    'table': 'TESTTABLE',
+                    'channel_name': 'TEST',
+                }
+                client.account = 'testorg-testacct'
+                client.user = 'TESTUSER'
+                client.database = 'TESTDB'
+                client.schema = 'TESTSCHEMA'
+                client.table = 'TESTTABLE'
+                client.pipe = 'TESTTABLE-STREAMING'
+                client.channel_name = 'TEST_20260409'
+                client.auth = MagicMock()
+                client.auth.get_scoped_token.return_value = 'mock-token'
+                client.ingest_host = 'test.snowflakecomputing.com'
+                client.scoped_token = 'mock-token'
+                client._token_obtained_at = time.time()
+                client.continuation_token = 'ct-123'
+                client.offset_token = 0
+                client._channel_open = True
+                client._session = MagicMock()
+                client.stats = {
+                    'rows_sent': 0, 'batches': 0, 'bytes_sent': 0,
+                    'errors': 0, 'retries': 0, 'channel_reopens': 0,
+                    'token_refreshes': 0, 'start_time': time.time(),
+                }
+                return client
+
+    def test_retry_on_429_throttling(self):
+        """Test exponential backoff retry on 429 Too Many Requests."""
+        from snowpipe_streaming_client import SnowpipeStreamingClient
+        client = self._make_client()
+
+        mock_429 = MagicMock()
+        mock_429.status_code = 429
+        mock_429.headers = {'Retry-After': '0.01'}
+
+        mock_200 = MagicMock()
+        mock_200.status_code = 200
+        mock_200.json.return_value = {'next_continuation_token': 'ct-new'}
+
+        client._session.request.side_effect = [mock_429, mock_200]
+
+        result = client._make_request('POST', 'https://test.example.com/rows')
+        assert result.status_code == 200
+        assert client.stats['retries'] == 1
+
+    def test_retry_on_500_server_error(self):
+        """Test retry on 500 server error."""
+        client = self._make_client()
+
+        mock_500 = MagicMock()
+        mock_500.status_code = 500
+        mock_500.headers = {}
+
+        mock_200 = MagicMock()
+        mock_200.status_code = 200
+
+        client._session.request.side_effect = [mock_500, mock_200]
+
+        with patch('snowpipe_streaming_client.INITIAL_BACKOFF_SEC', 0.01):
+            result = client._make_request('GET', 'https://test.example.com')
+        assert result.status_code == 200
+        assert client.stats['retries'] == 1
+
+    def test_409_raises_for_channel_reopen(self):
+        """Test that 409 raises HTTPError for caller to handle channel reopen."""
+        client = self._make_client()
+
+        mock_409 = MagicMock()
+        mock_409.status_code = 409
+        mock_409.raise_for_status.side_effect = requests.exceptions.HTTPError(
+            response=mock_409
+        )
+
+        client._session.request.return_value = mock_409
+
+        with pytest.raises(requests.exceptions.HTTPError):
+            client._make_request('POST', 'https://test.example.com/rows')
+
+    def test_token_refresh_on_401(self):
+        """Test token refresh when 401 Unauthorized is received."""
+        client = self._make_client()
+
+        mock_401 = MagicMock()
+        mock_401.status_code = 401
+
+        mock_200 = MagicMock()
+        mock_200.status_code = 200
+
+        client._session.request.side_effect = [mock_401, mock_200]
+
+        result = client._make_request('GET', 'https://test.example.com')
+        assert result.status_code == 200
+        assert client.stats['token_refreshes'] == 1
+
+    def test_token_refresh_before_expiry(self):
+        """Test that token is proactively refreshed before expiry."""
+        client = self._make_client()
+        # Set token obtained long ago (expired)
+        client._token_obtained_at = time.time() - 4000
+        client.scoped_token = 'old-token'
+
+        new_token = client._get_scoped_token()
+        assert client.auth.get_scoped_token.called
+        assert client.stats['token_refreshes'] == 1
+
+    def test_reopen_channel_generates_new_name(self):
+        """Test that reopen_channel creates a new channel name."""
+        client = self._make_client()
+        old_name = client.channel_name
+
+        # Mock open_channel to succeed
+        with patch.object(client, 'open_channel', return_value={'channel_status': {}}):
+            client.reopen_channel()
+
+        assert client.channel_name != old_name
+        assert '_r1' in client.channel_name
+        assert client.stats['channel_reopens'] == 1
+
+    def test_check_channel_health_success(self):
+        """Test check_channel_health returns True for healthy channel."""
+        client = self._make_client()
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            'channel_status': {
+                'channel_status_code': 'SUCCESS',
+                'rows_inserted': 100,
+                'rows_parsed': 100,
+                'rows_error_count': 0,
+                'snowflake_avg_processing_latency_ms': 50,
+            }
+        }
+        client._session.request.return_value = mock_response
+
+        assert client.check_channel_health() is True
+
+    def test_check_channel_health_fatal_error_triggers_reopen(self):
+        """Test that fatal channel errors trigger auto-reopen."""
+        client = self._make_client()
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            'channel_status': {
+                'channel_status_code': 'ERR_CHANNEL_MUST_BE_REOPENED',
+                'last_error_message': 'Channel must be reopened',
+            }
+        }
+        client._session.request.return_value = mock_response
+
+        with patch.object(client, 'reopen_channel', return_value={}):
+            result = client.check_channel_health()
+            assert result is False
+            client.reopen_channel.assert_called_once()
+
+    def test_connection_pooling_uses_session(self):
+        """Test that the client uses requests.Session for connection pooling."""
+        client = self._make_client()
+        assert client._session is not None
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        client._session.request.return_value = mock_response
+
+        client._make_request('GET', 'https://test.example.com')
+        client._session.request.assert_called_once()
+
+    def test_append_rows_retries_on_409(self):
+        """Test that append_rows auto-reopens channel on 409 and retries."""
+        client = self._make_client()
+
+        mock_409 = MagicMock()
+        mock_409.status_code = 409
+        mock_409.raise_for_status.side_effect = requests.exceptions.HTTPError(
+            response=mock_409
+        )
+
+        mock_200 = MagicMock()
+        mock_200.status_code = 200
+        mock_200.json.return_value = {'next_continuation_token': 'ct-new'}
+
+        # First call to _make_request raises 409, after reopen succeeds
+        call_count = [0]
+        original_make_request = client._make_request
+
+        def mock_make_request(method, url, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise requests.exceptions.HTTPError(response=mock_409)
+            return mock_200
+
+        with patch.object(client, '_make_request', side_effect=mock_make_request):
+            with patch.object(client, 'reopen_channel', return_value={'channel_status': {}}):
+                result = client.append_rows([{'id': 'test', 'question': 'Test?'}])
+                assert result == {'next_continuation_token': 'ct-new'}
 
 
 if __name__ == '__main__':

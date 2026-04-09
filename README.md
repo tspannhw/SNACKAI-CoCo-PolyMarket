@@ -58,6 +58,12 @@ Stream Polymarket prediction market data to Snowflake via **Snowpipe Streaming v
 | Manage Script | start/stop/install/setup/test/validate | Active |
 | Zod Validation | Type-safe API data validation | Active |
 | Full Test Suite | Python pytest + Jest | Active |
+| HTTP Retry + Backoff | Exponential backoff for 429/5XX errors | Active |
+| Channel Auto-Reopen | Auto-reopen on 409 and fatal channel errors | Active |
+| Token Refresh | Proactive token refresh before expiry | Active |
+| Connection Pooling | TCP/TLS reuse via `requests.Session` | Active |
+| Error Logging | SSv2 error tables for failed rows (GA Apr 2026) | Active |
+| Channel Monitoring | `V_STREAMING_CHANNEL_HEALTH` view | Active |
 
 ## Data Sources
 
@@ -328,6 +334,86 @@ Throughput-based billing. See [Snowpipe Streaming costs](https://docs.snowflake.
 | `V_LATEST_MARKETS` | Latest snapshot per market (deduplicated) |
 | `V_MARKET_VOLUME_SUMMARY` | Volume aggregated by category |
 | `V_INGESTION_HEALTH` | Streaming metrics by minute |
+| `V_STREAMING_CHANNEL_HEALTH` | SSv2 channel errors, latency, row counts |
+
+### Row Timestamps (METADATA$ROW_LAST_COMMIT_TIME)
+
+All three tables have `ROW_TIMESTAMP = TRUE` enabled, which exposes the `METADATA$ROW_LAST_COMMIT_TIME` virtual column. This tracks when each row was last committed to Snowflake, enabling:
+
+- **Ingestion latency measurement**: Compare `METADATA$ROW_LAST_COMMIT_TIME` against client-side timestamps to measure SSv2 commit delay
+- **Change tracking**: Identify the most recently modified rows
+- **Incremental processing**: Use row timestamps for efficient downstream ETL
+
+The schema also has `ROW_TIMESTAMP_DEFAULT = TRUE`, so any new tables created in `POLYMARKET.STREAMING` automatically get row timestamps.
+
+```sql
+-- Query row timestamps
+SELECT METADATA$ROW_LAST_COMMIT_TIME AS committed_at, id, question
+FROM POLYMARKET.STREAMING.MARKETS
+ORDER BY committed_at DESC
+LIMIT 10;
+```
+
+### Timezone Display
+
+The dashboard displays all dates and times in **US Eastern Time (EST/EDT)**:
+
+- Header shows the full current date: e.g., "Wednesday, April 9, 2026, 2:30 PM EDT"
+- Ingestion Health chart X-axis labels use 12-hour EST format
+- Market card end dates show date + time in EST
+- The `formatDateEST()` and `formatTimeEST()` utilities in `lib/utils.ts` use `America/New_York` timezone via `Intl.DateTimeFormat`
+
+### Error Logging (SSv2 Error Tables)
+
+All three tables have `ERROR_LOGGING = TRUE` enabled (GA April 8, 2026). When a row fails server-side validation during Snowpipe Streaming (schema mismatch, type errors, constraint violations), it is captured in a dedicated error table instead of being silently dropped.
+
+```sql
+-- Check for streaming errors on the MARKETS table
+SELECT * FROM TABLE(POLYMARKET.INFORMATION_SCHEMA.STREAMING_ERROR_LOG('STREAMING.MARKETS'));
+```
+
+Error tables are auto-created by Snowflake when errors occur. If no errors have happened yet, the query returns 0 rows (expected).
+
+### Channel Monitoring
+
+The `V_STREAMING_CHANNEL_HEALTH` view provides a convenient dashboard over `SNOWFLAKE.ACCOUNT_USAGE.SNOWPIPE_STREAMING_CHANNEL_HISTORY`:
+
+```sql
+-- Check channel health, errors, and latency
+SELECT * FROM POLYMARKET.STREAMING.V_STREAMING_CHANNEL_HEALTH LIMIT 10;
+```
+
+Key columns: `ROWS_INSERTED`, `ROWS_PARSED`, `ROW_ERROR_COUNT`, `LAST_ERROR_MESSAGE`, `SNOWFLAKE_PROCESSING_LATENCY_MS`.
+
+**SSv2 Default Pipe Visibility**: The auto-created pipes (`MARKETS-STREAMING`, `INGESTION_METRICS-STREAMING`) are Snowflake-managed (`is_snowflake_managed=true`, `owner=NULL`). ACCOUNTADMIN can see them via `SHOW PIPES IN SCHEMA POLYMARKET.STREAMING` but GRANT MONITOR is not supported on managed pipes.
+
+### SSv2 Client Error Handling
+
+The Python streaming client (`snowpipe_streaming_client.py`) implements the full SSv2 error handling spec:
+
+| HTTP Code | Error | Client Action |
+|-----------|-------|---------------|
+| 429 | Throttling | Exponential backoff retry (respects `Retry-After` header) |
+| 408 | Request timeout | Exponential backoff retry |
+| 500/502/503/504 | Server error | Exponential backoff retry (up to 5 retries) |
+| 409 | Channel invalidated | Auto-reopen channel, resume from last committed offset |
+| 401 | Unauthorized | Refresh token, retry once |
+| 403 | Forbidden | Refresh token, retry once; if persistent, fail with error |
+
+**Fatal channel error codes** (auto-reopen via `check_channel_health()`):
+
+- `ERR_PIPE_DOES_NOT_EXIST_OR_NOT_AUTHORIZED`
+- `ERR_TABLE_DOES_NOT_EXIST_NOT_AUTHORIZED`
+- `ERR_CHANNEL_HAS_INVALID_ROW_SEQUENCER`
+- `ERR_CHANNEL_HAS_INVALID_CLIENT_SEQUENCER`
+- `ERR_CHANNEL_MUST_BE_REOPENED`
+- `ERR_CHANNEL_MUST_BE_REOPENED_DUE_TO_ROW_SEQ_GAP`
+
+**Performance optimizations**:
+
+- **Connection pooling**: Uses `requests.Session()` for TCP/TLS connection reuse across requests
+- **Token refresh**: Proactively refreshes auth tokens 5 minutes before expiry (no mid-batch auth failures)
+- **Channel health checks**: After each batch, polls channel status to detect errors early
 
 ### INGESTION_METRICS Table
 
@@ -464,7 +550,7 @@ npm test
 
 ### Test Coverage
 
-**Python tests** (`test_polymarket.py` — 19 tests):
+**Python tests** (`test_polymarket.py` — 29 tests):
 
 | Test Class | Tests | What It Covers |
 |------------|-------|----------------|
@@ -473,8 +559,9 @@ npm test
 | `TestDataIntegrity` | 6 | Required fields, edge cases, empty lists, deduplication |
 | `TestMetricsRow` | 3 | Metrics row structure, error rows, failure isolation |
 | `TestStreamingClient` | 3 | Client init, auth selection, row serialization |
+| `TestStreamingClientRetry` | 10 | HTTP retry (429/5XX), channel reopen (409), token refresh, connection pooling, channel health |
 
-**Jest tests** (`__tests__/utils.test.ts` — 22 tests):
+**Jest tests** (`__tests__/utils.test.ts` — 28 tests):
 
 | Suite | Tests | What It Covers |
 |-------|-------|----------------|
@@ -482,6 +569,8 @@ npm test
 | `parseOutcomePrices` | 5 | Price arrays, non-numeric values, edge cases |
 | `formatVolume` | 5 | K/M/B suffixes, zero, negative, small values |
 | `formatPrice` | 2 | Percentage formatting, null handling |
+| `formatDateEST` | 3 | EST timezone output, known date formatting, null handling |
+| `formatTimeEST` | 2 | EST time formatting, null/undefined handling |
 | `ExportRequestSchema` | 5 | Zod validation, required fields, format enum |
 
 ### Pipeline Validation Checks
@@ -517,6 +606,11 @@ Run via `./manage.sh validate` or `python validation.py`:
 | Dashboard connection drops | Stale Snowflake connection cached | The dashboard auto-reconnects on connection errors. Restart if persistent: `./manage.sh restart` |
 | `Snowflake not configured` | Missing `.env.local` | Copy `.env.example` to `.env.local` and set credentials |
 | `ModuleNotFoundError` | Venv not activated | Run `source venv/bin/activate` |
+| `409 Channel invalidated` | Channel superseded or invalidated | Client auto-reopens channel. If persistent, check for concurrent clients |
+| `429 Too Many Requests` | SSv2 throttling | Client auto-retries with exponential backoff. Reduce `--batch-size` if persistent |
+| `ERR_CHANNEL_MUST_BE_REOPENED` | Fatal channel error | Client auto-detects via `check_channel_health()` and reopens. Check `V_STREAMING_CHANNEL_HEALTH` for details |
+| Token expiry mid-batch | OAuth token expired | Client proactively refreshes tokens 5 min before expiry. If using PAT, ensure it hasn't been revoked |
+| Streaming errors not captured | `ERROR_LOGGING` not enabled | Run `ALTER TABLE ... SET ERROR_LOGGING = TRUE` (see `SETUP_SNOWFLAKE.sql` Section 3c) |
 
 ## Tech Stack
 
@@ -534,6 +628,8 @@ Run via `./manage.sh validate` or `python validation.py`:
 ## References
 
 - [Snowpipe Streaming v2 Overview](https://docs.snowflake.com/en/user-guide/snowpipe-streaming/snowpipe-streaming-high-performance-overview)
+- [SSv2 Error Handling](https://docs.snowflake.com/en/user-guide/snowpipe-streaming/snowpipe-streaming-high-performance-error-handling)
+- [SSv2 Error Logging (GA Apr 2026)](https://docs.snowflake.com/en/release-notes/2026/other/2026-04-08-snowpipe-streaming-error-tables)
 - [Polymarket API Docs](https://docs.polymarket.com/api-reference/markets/list-markets)
 - [Snowflake PAT Auth](https://docs.snowflake.com/en/user-guide/authentication-programmatic-tokens)
 - [Snowflake JWT Auth](https://docs.snowflake.com/en/developer-guide/sql-api/guide#using-key-pair-authentication)

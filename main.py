@@ -104,6 +104,14 @@ def stream_markets(
         metrics['stream_duration_ms'] = (time.time() - stream_start) * 1000
         metrics['total_duration_ms'] = (time.time() - start_time) * 1000
 
+        # Check channel health after batch (detects fatal errors, logs metrics)
+        try:
+            channel_healthy = client.check_channel_health()
+            if not channel_healthy:
+                logger.warning("Channel was unhealthy and has been reopened")
+        except Exception as e:
+            logger.warning(f"Channel health check failed: {e}")
+
         logger.info(
             f"Batch {batch_id}: "
             f"{metrics['markets_streamed']}/{metrics['markets_fetched']} markets streamed, "
@@ -164,6 +172,16 @@ def stream_ingestion_metrics(metrics_client: SnowpipeStreamingClient, metrics: d
             'offset_token': metrics_client.offset_token,
             'channel_name': metrics_client.channel_name,
         }
+
+        # Log channel stats for observability
+        client_stats = metrics.get('client_stats')
+        if client_stats:
+            logger.info(
+                f"Channel stats: retries={client_stats.get('retries', 0)}, "
+                f"reopens={client_stats.get('channel_reopens', 0)}, "
+                f"token_refreshes={client_stats.get('token_refreshes', 0)}"
+            )
+
         metrics_client.append_rows([row])
         logger.info(f"Ingestion metrics streamed for batch {metrics.get('batch_id', 'unknown')}")
     except Exception as e:
@@ -209,6 +227,9 @@ def run_continuous(
         logger.info(f"\n--- Cycle {cycle} ---")
 
         metrics = stream_markets(client, fetcher, max_pages=max_pages, batch_size=batch_size)
+
+        # Attach client stats for observability logging in metrics streaming
+        metrics['client_stats'] = client.stats.copy()
 
         # Stream ingestion metrics so the dashboard can display pipeline health
         if metrics_client:

@@ -1,6 +1,7 @@
 'use client';
 
 import { formatVolume, formatPrice, parseOutcomes, parseOutcomePrices } from '@/lib/validations';
+import { formatTimeEST } from '@/lib/utils';
 
 interface Market {
   ID?: string | null;
@@ -74,7 +75,7 @@ export function MarketCard({ market }: { market: Market }) {
             <CategoryBadge category={market.CATEGORY} />
             {market.END_DATE && (
               <span className="text-[10px] text-gray-500">
-                Ends {new Date(market.END_DATE).toLocaleDateString()}
+                Ends {new Date(market.END_DATE).toLocaleDateString('en-US', { timeZone: 'America/New_York', month: 'short', day: 'numeric', year: 'numeric' })} {formatTimeEST(market.END_DATE)}
               </span>
             )}
           </div>

@@ -27,3 +27,29 @@ export function timeAgo(dateStr: string | null | undefined): string {
   const days = Math.floor(hours / 24);
   return `${days}d ago`;
 }
+
+export function formatDateEST(dateStr?: string | null): string {
+  const date = dateStr ? new Date(dateStr) : new Date();
+  return date.toLocaleString('en-US', {
+    timeZone: 'America/New_York',
+    weekday: 'long',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+    timeZoneName: 'short',
+  });
+}
+
+export function formatTimeEST(dateStr: string | null | undefined): string {
+  if (!dateStr) return '';
+  return new Date(dateStr).toLocaleString('en-US', {
+    timeZone: 'America/New_York',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+    timeZoneName: 'short',
+  });
+}

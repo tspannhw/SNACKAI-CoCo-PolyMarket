@@ -5,11 +5,20 @@ Snowpipe Streaming v2 High-Performance REST API Client
 Implements the Snowpipe Streaming v2 REST API for high-throughput
 real-time data ingestion into Snowflake.
 
+Features:
+  - HTTP retry with exponential backoff (429, 408, 5XX)
+  - Channel reopen on 409 (channel invalidated)
+  - Channel status monitoring with fatal error detection
+  - Token refresh before expiry
+  - Connection pooling via requests.Session
+  - Comprehensive error handling per SSv2 docs
+
 Architecture:
   Local Python Client -> Snowpipe Streaming v2 REST API -> Snowflake Table
 
 Reference:
   https://docs.snowflake.com/en/user-guide/snowpipe-streaming/snowpipe-streaming-high-performance-overview
+  https://docs.snowflake.com/en/user-guide/snowpipe-streaming/snowpipe-streaming-high-performance-error-handling
 """
 
 import json
@@ -23,6 +32,30 @@ from snowflake_jwt_auth import SnowflakeJWTAuth
 
 logger = logging.getLogger(__name__)
 
+# Fatal channel error codes that require channel reopen (per SSv2 docs)
+FATAL_CHANNEL_ERRORS = {
+    'ERR_PIPE_DOES_NOT_EXIST_OR_NOT_AUTHORIZED',
+    'ERR_TABLE_DOES_NOT_EXIST_NOT_AUTHORIZED',
+    'ERR_CHANNEL_HAS_INVALID_ROW_SEQUENCER',
+    'ERR_CHANNEL_HAS_INVALID_CLIENT_SEQUENCER',
+    'ERR_CHANNEL_MUST_BE_REOPENED',
+    'ERR_CHANNEL_MUST_BE_REOPENED_DUE_TO_ROW_SEQ_GAP',
+}
+
+# HTTP status codes that are retryable (per SSv2 docs)
+RETRYABLE_STATUS_CODES = {429, 408, 500, 502, 503, 504}
+
+# Retry configuration
+MAX_RETRIES = 5
+INITIAL_BACKOFF_SEC = 1.0
+MAX_BACKOFF_SEC = 60.0
+BACKOFF_MULTIPLIER = 2.0
+
+# Token refresh: refresh 5 minutes before expiry
+TOKEN_REFRESH_MARGIN_SEC = 300
+# Default token lifetime (55 minutes for JWT OAuth, PAT doesn't expire via API)
+DEFAULT_TOKEN_LIFETIME_SEC = 3300
+
 
 class SnowpipeStreamingClient:
     """
@@ -32,6 +65,12 @@ class SnowpipeStreamingClient:
     setup. No CREATE PIPE DDL required.
 
     Supports PAT and JWT key-pair authentication.
+
+    Error handling follows SSv2 docs:
+    - 429/408/5XX: Exponential backoff retry
+    - 409: Channel invalidated, auto-reopen from last committed offset
+    - 401/403: Auth error, refresh token and retry once
+    - Fatal channel errors: Auto-reopen channel
     """
 
     def __init__(self, config_path: str = "snowflake_config.json"):
@@ -60,14 +99,22 @@ class SnowpipeStreamingClient:
 
         self.ingest_host = None
         self.scoped_token = None
+        self._token_obtained_at = 0.0
         self.continuation_token = None
         self.offset_token = 0
+        self._channel_open = False
+
+        # Connection pooling via requests.Session for TCP/TLS reuse
+        self._session = requests.Session()
 
         self.stats = {
             'rows_sent': 0,
             'batches': 0,
             'bytes_sent': 0,
             'errors': 0,
+            'retries': 0,
+            'channel_reopens': 0,
+            'token_refreshes': 0,
             'start_time': time.time()
         }
 
@@ -89,30 +136,108 @@ class SnowpipeStreamingClient:
         return f"https://{account_parts[0]}.snowflakecomputing.com"
 
     def _get_scoped_token(self) -> str:
-        """Get authentication token for API calls."""
-        if self.scoped_token:
+        """Get authentication token, refreshing if near expiry."""
+        now = time.time()
+        token_age = now - self._token_obtained_at
+
+        if self.scoped_token and token_age < (DEFAULT_TOKEN_LIFETIME_SEC - TOKEN_REFRESH_MARGIN_SEC):
             return self.scoped_token
 
-        # Use the auth module to get the token (PAT or JWT-exchanged OAuth)
+        if self.scoped_token:
+            logger.info(f"Token age {token_age:.0f}s, refreshing before expiry...")
+            self.stats['token_refreshes'] += 1
+
         self.scoped_token = self.auth.get_scoped_token()
+        self._token_obtained_at = time.time()
         logger.info("Scoped token obtained")
         return self.scoped_token
+
+    def _refresh_token(self):
+        """Force token refresh (called after 401/403 errors)."""
+        logger.info("Forcing token refresh due to auth error...")
+        self.scoped_token = None
+        self._token_obtained_at = 0.0
+        self.stats['token_refreshes'] += 1
+        self._get_scoped_token()
+
+    def _make_request(self, method: str, url: str, **kwargs) -> requests.Response:
+        """
+        Make an HTTP request with retry logic per SSv2 docs.
+
+        Handles:
+        - 429/408/5XX: Exponential backoff retry
+        - 401/403: Token refresh + single retry
+        - 409: Raise immediately (caller handles channel reopen)
+        """
+        headers = kwargs.pop('headers', {})
+        headers['Authorization'] = f"Bearer {self._get_scoped_token()}"
+        if 'Content-Type' not in headers:
+            headers['Content-Type'] = 'application/json'
+
+        last_exception = None
+        backoff = INITIAL_BACKOFF_SEC
+
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                response = self._session.request(method, url, headers=headers, **kwargs)
+
+                # Success
+                if response.status_code < 400:
+                    return response
+
+                # Channel invalidated — raise immediately for caller to handle
+                if response.status_code == 409:
+                    logger.warning(f"409 Channel invalidated: {url}")
+                    response.raise_for_status()
+
+                # Auth errors — refresh token and retry once
+                if response.status_code in (401, 403):
+                    if attempt == 0:
+                        logger.warning(f"{response.status_code} Auth error, refreshing token...")
+                        self._refresh_token()
+                        headers['Authorization'] = f"Bearer {self.scoped_token}"
+                        continue
+                    logger.error(f"{response.status_code} Auth error persists after token refresh")
+                    response.raise_for_status()
+
+                # Retryable errors (429, 408, 5XX)
+                if response.status_code in RETRYABLE_STATUS_CODES:
+                    self.stats['retries'] += 1
+                    retry_after = response.headers.get('Retry-After')
+                    wait = float(retry_after) if retry_after else backoff
+
+                    logger.warning(
+                        f"{response.status_code} on attempt {attempt + 1}/{MAX_RETRIES + 1}, "
+                        f"retrying in {wait:.1f}s..."
+                    )
+                    time.sleep(wait)
+                    backoff = min(backoff * BACKOFF_MULTIPLIER, MAX_BACKOFF_SEC)
+                    continue
+
+                # Non-retryable error
+                response.raise_for_status()
+
+            except requests.exceptions.ConnectionError as e:
+                self.stats['retries'] += 1
+                last_exception = e
+                if attempt < MAX_RETRIES:
+                    logger.warning(f"Connection error on attempt {attempt + 1}, retrying in {backoff:.1f}s: {e}")
+                    time.sleep(backoff)
+                    backoff = min(backoff * BACKOFF_MULTIPLIER, MAX_BACKOFF_SEC)
+                    continue
+                raise
+
+        # Should not reach here, but just in case
+        if last_exception:
+            raise last_exception
+        raise RuntimeError(f"Request failed after {MAX_RETRIES + 1} attempts")
 
     def discover_ingest_host(self) -> str:
         """Discover the streaming ingest host endpoint."""
         logger.info("Discovering ingest host...")
-        self._get_scoped_token()
 
         url = f"{self._get_account_url()}/v2/streaming/hostname"
-        headers = {
-            "Authorization": f"Bearer {self.scoped_token}",
-            "Content-Type": "application/json"
-        }
-
-        response = requests.get(url, headers=headers)
-        if response.status_code != 200:
-            logger.error(f"Failed to discover host: {response.status_code}")
-            response.raise_for_status()
+        response = self._make_request('GET', url)
 
         response_text = response.text.strip()
         if not response_text:
@@ -138,12 +263,7 @@ class SnowpipeStreamingClient:
                f"databases/{self.database}/schemas/{self.schema}/"
                f"pipes/{self.pipe}/channels/{self.channel_name}")
 
-        headers = {
-            "Authorization": f"Bearer {self.scoped_token}",
-            "Content-Type": "application/json"
-        }
-
-        response = requests.put(url, headers=headers, json={})
+        response = self._make_request('PUT', url, json={})
         response.raise_for_status()
 
         result = response.json()
@@ -152,15 +272,40 @@ class SnowpipeStreamingClient:
         self.offset_token = int(
             channel_status.get('last_committed_offset_token', '0') or '0'
         )
+        self._channel_open = True
 
         logger.info("Channel opened successfully")
         logger.info(f"Continuation token: {self.continuation_token}")
         logger.info(f"Initial offset: {self.offset_token}")
         return result
 
+    def reopen_channel(self) -> dict:
+        """
+        Close and reopen the channel with a new name.
+
+        Called when channel enters an invalid state (409, fatal error codes).
+        Resumes from the last committed offset per SSv2 docs.
+        """
+        logger.warning(f"Reopening channel (was: {self.channel_name})...")
+        self.stats['channel_reopens'] += 1
+        self._channel_open = False
+
+        # Generate a new channel name with fresh timestamp
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        base_name = self.config.get('channel_name', 'POLYMARKET')
+        self.channel_name = f"{base_name}_{timestamp}_r{self.stats['channel_reopens']}"
+        self.continuation_token = None
+
+        logger.info(f"New channel name: {self.channel_name}")
+        return self.open_channel()
+
     def append_rows(self, rows: List[Dict]) -> dict:
         """
         Append rows to the streaming channel.
+
+        Handles:
+        - 409: Auto-reopen channel and retry
+        - Retryable errors: Exponential backoff via _make_request
 
         Args:
             rows: List of dictionaries, each representing a row.
@@ -186,13 +331,21 @@ class SnowpipeStreamingClient:
                f"?continuationToken={self.continuation_token}"
                f"&offsetToken={self.offset_token}")
 
-        headers = {
-            "Authorization": f"Bearer {self.scoped_token}",
-            "Content-Type": "application/x-ndjson"
-        }
-
-        response = requests.post(url, headers=headers, data=payload_bytes)
-        response.raise_for_status()
+        try:
+            response = self._make_request(
+                'POST', url,
+                headers={'Content-Type': 'application/x-ndjson'},
+                data=payload_bytes
+            )
+            response.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 409:
+                # Channel invalidated — reopen and retry once
+                logger.warning("Channel invalidated (409), reopening and retrying...")
+                self.reopen_channel()
+                return self.append_rows(rows)
+            self.stats['errors'] += 1
+            raise
 
         result = response.json()
         self.continuation_token = result.get('next_continuation_token')
@@ -205,7 +358,16 @@ class SnowpipeStreamingClient:
         return result
 
     def get_channel_status(self) -> Optional[dict]:
-        """Get the current channel status."""
+        """
+        Get the current channel status.
+
+        Returns channel health info including:
+        - channel_status_code: SUCCESS or fatal error code
+        - last_committed_offset_token: progress tracking
+        - rows_inserted, rows_parsed, rows_error_count
+        - last_error_message, last_error_timestamp
+        - snowflake_avg_processing_latency_ms
+        """
         if not self.ingest_host:
             return None
 
@@ -213,23 +375,59 @@ class SnowpipeStreamingClient:
                f"databases/{self.database}/schemas/{self.schema}/"
                f"pipes/{self.pipe}/channels/{self.channel_name}")
 
-        headers = {
-            "Authorization": f"Bearer {self.scoped_token}",
-            "Content-Type": "application/json"
-        }
-
         try:
-            response = requests.get(url, headers=headers)
+            response = self._make_request('GET', url)
             response.raise_for_status()
             return response.json()
         except Exception as e:
             logger.warning(f"Failed to get channel status: {e}")
             return None
 
+    def check_channel_health(self) -> bool:
+        """
+        Check channel health and auto-reopen if in a fatal error state.
+
+        Returns:
+            True if channel is healthy (SUCCESS), False if reopen was needed.
+        """
+        status = self.get_channel_status()
+        if status is None:
+            logger.warning("Could not retrieve channel status")
+            return True  # Assume OK if we can't check
+
+        channel_info = status.get('channel_status', status)
+        status_code = channel_info.get('channel_status_code', 'SUCCESS')
+
+        if status_code == 'SUCCESS':
+            # Log metrics
+            rows_inserted = channel_info.get('rows_inserted', 'N/A')
+            rows_parsed = channel_info.get('rows_parsed', 'N/A')
+            error_count = channel_info.get('rows_error_count', 0)
+            latency = channel_info.get('snowflake_avg_processing_latency_ms', 'N/A')
+
+            logger.info(
+                f"Channel healthy: inserted={rows_inserted}, parsed={rows_parsed}, "
+                f"errors={error_count}, latency={latency}ms"
+            )
+            return True
+
+        # Fatal error — reopen required
+        if status_code in FATAL_CHANNEL_ERRORS:
+            error_msg = channel_info.get('last_error_message', 'unknown')
+            logger.error(f"Fatal channel error: {status_code} - {error_msg}")
+            self.reopen_channel()
+            return False
+
+        # Unknown status code
+        logger.warning(f"Unexpected channel status: {status_code}")
+        return True
+
     def close_channel(self):
         """Close the streaming channel."""
         logger.info(f"Closing channel: {self.channel_name}")
+        self._channel_open = False
         # Channels auto-close after inactivity
+        self._session.close()
         self.print_stats()
 
     def print_stats(self):
@@ -238,14 +436,17 @@ class SnowpipeStreamingClient:
         logger.info("=" * 60)
         logger.info("INGESTION STATISTICS")
         logger.info("=" * 60)
-        logger.info(f"Total rows sent:   {self.stats['rows_sent']}")
-        logger.info(f"Total batches:     {self.stats['batches']}")
-        logger.info(f"Total bytes sent:  {self.stats['bytes_sent']:,}")
-        logger.info(f"Errors:            {self.stats['errors']}")
-        logger.info(f"Elapsed time:      {elapsed:.2f}s")
+        logger.info(f"Total rows sent:     {self.stats['rows_sent']}")
+        logger.info(f"Total batches:       {self.stats['batches']}")
+        logger.info(f"Total bytes sent:    {self.stats['bytes_sent']:,}")
+        logger.info(f"Errors:              {self.stats['errors']}")
+        logger.info(f"Retries:             {self.stats['retries']}")
+        logger.info(f"Channel reopens:     {self.stats['channel_reopens']}")
+        logger.info(f"Token refreshes:     {self.stats['token_refreshes']}")
+        logger.info(f"Elapsed time:        {elapsed:.2f}s")
         if elapsed > 0:
-            logger.info(f"Throughput:        {self.stats['rows_sent']/elapsed:.2f} rows/sec")
-        logger.info(f"Current offset:    {self.offset_token}")
+            logger.info(f"Throughput:          {self.stats['rows_sent']/elapsed:.2f} rows/sec")
+        logger.info(f"Current offset:      {self.offset_token}")
         logger.info("=" * 60)
 
     def get_stats(self) -> dict:

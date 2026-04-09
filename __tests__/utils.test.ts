@@ -1,5 +1,5 @@
 import { describe, expect, test } from '@jest/globals';
-import { cn, formatNumber, formatCurrency, timeAgo } from '../lib/utils';
+import { cn, formatNumber, formatCurrency, timeAgo, formatDateEST, formatTimeEST } from '../lib/utils';
 import {
   parseOutcomes,
   parseOutcomePrices,
@@ -161,6 +161,43 @@ describe('formatPrice', () => {
   test('handles null/undefined', () => {
     expect(formatPrice(null)).toBe('—');
     expect(formatPrice(undefined)).toBe('—');
+  });
+});
+
+describe('formatDateEST', () => {
+  test('returns a string containing EST or EDT timezone', () => {
+    const result = formatDateEST();
+    expect(result).toMatch(/E[SD]T/);
+  });
+
+  test('formats a known date correctly', () => {
+    // Jan 15, 2025 at 17:30 UTC = 12:30 PM EST
+    const result = formatDateEST('2025-01-15T17:30:00Z');
+    expect(result).toContain('January');
+    expect(result).toContain('15');
+    expect(result).toContain('2025');
+    expect(result).toContain('EST');
+  });
+
+  test('handles null by returning current date', () => {
+    const result = formatDateEST(null);
+    expect(result.length).toBeGreaterThan(10);
+    expect(result).toMatch(/E[SD]T/);
+  });
+});
+
+describe('formatTimeEST', () => {
+  test('formats time in EST timezone', () => {
+    // Jan 15, 2025 at 17:30 UTC = 12:30 PM EST
+    const result = formatTimeEST('2025-01-15T17:30:00Z');
+    expect(result).toContain('12:30');
+    expect(result).toContain('PM');
+    expect(result).toContain('EST');
+  });
+
+  test('handles null/undefined', () => {
+    expect(formatTimeEST(null)).toBe('');
+    expect(formatTimeEST(undefined)).toBe('');
   });
 });
 

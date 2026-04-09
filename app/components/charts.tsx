@@ -96,7 +96,7 @@ export function IngestionHealthChart({ data }: IngestionChartProps) {
     .reverse()
     .slice(-30)
     .map((d) => ({
-      time: d.MINUTE_BUCKET ? new Date(d.MINUTE_BUCKET).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '',
+      time: d.MINUTE_BUCKET ? new Date(d.MINUTE_BUCKET).toLocaleTimeString('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: true }) : '',
       markets: d.TOTAL_MARKETS || 0,
       latency: Math.round(d.AVG_DURATION_MS || 0),
       errors: d.ERROR_COUNT || 0,
