@@ -42,6 +42,18 @@ Stream Polymarket prediction market data to Snowflake via **Snowpipe Streaming v
 ╚══════════════════════════════════════════════════════════════════════════════╝
 ```
 
+## Dashboard Run
+
+
+![Dash](https://github.com/tspannhw/SNACKAI-CoCo-PolyMarket/blob/main/app/images/dashboad2.png?raw=true)
+
+![Dash](https://github.com/tspannhw/SNACKAI-CoCo-PolyMarket/blob/main/app/images/dashboard1.png?raw=true)
+
+![Dash](https://github.com/tspannhw/SNACKAI-CoCo-PolyMarket/blob/main/app/images/dashboard3.png?raw=true)
+
+![Dash](https://github.com/tspannhw/SNACKAI-CoCo-PolyMarket/blob/main/app/images/dashboard4.png?raw=true)
+
+
 ## Features
 
 | Feature                   | Description                                | Status |
