@@ -28,9 +28,9 @@ Stream Polymarket prediction market data to Snowflake via **Snowpipe Streaming v
 ║  ┌─────────────────────────────────────────┐      │ V_MARKET_VOLUME_    │    ║
 ║  │ REACT DASHBOARD (Next.js)               │      │   SUMMARY           │    ║
 ║  │                                         │      │ V_INGESTION_HEALTH  │    ║
-║  │ ┌─────────┐ ┌──────────┐ ┌──────────┐   │◀───---│ V_LATEST_MARKETS   │    ║
-║  │ │ Market  │ │ Charts   │ │ Stats    │   │       │                    │    ║
-║  │ │ Cards   │ │ Recharts │ │ KPIs     │   │       └────────────────────┘    ║
+║  │ ┌─────────┐ ┌──────────┐ ┌──────────┐   │◀──---│ V_LATEST_MARKETS    │    ║
+║  │ │ Market  │ │ Charts   │ │ Stats    │   │      │                     │    ║
+║  │ │ Cards   │ │ Recharts │ │ KPIs     │   │      └─────────────────────┘    ║
 ║  │ │ Table   │ │          │ │          │   │                                 ║
 ║  │ └─────────┘ └──────────┘ └──────────┘   │                                 ║
 ║  │                                         │                                 ║
@@ -44,9 +44,9 @@ Stream Polymarket prediction market data to Snowflake via **Snowpipe Streaming v
 
 ## Features
 
-| Feature | Description | Status |
-|---------|-------------|--------|
-| Snowpipe Streaming v2 | High-Performance REST API (10GB/s capable) | Active |
+| Feature                   | Description                                | Status |
+|---------------------------|--------------------------------------------|--------|
+| Snowpipe Streaming v2     | High-Performance REST API (10GB/s capable) | Active |
 | Default Auto-Created Pipe | No `CREATE PIPE` DDL required | Active |
 | PAT + JWT Auth | Programmatic Access Token or Key-Pair | Active |
 | React Dashboard | Next.js 15 + Tailwind CSS 4 + Recharts | Active |
