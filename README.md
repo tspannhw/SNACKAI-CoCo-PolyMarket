@@ -1,0 +1,446 @@
+# Polymarket Prediction Markets Streaming Dashboard
+
+Stream Polymarket prediction market data to Snowflake via **Snowpipe Streaming v2 High-Performance REST API**, with a real-time React dashboard built on Next.js.
+
+## Architecture
+
+```
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                 POLYMARKET STREAMING PIPELINE v1.0                         ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║                                                                            ║
+║  ┌─────────────────┐    ┌──────────────────┐    ┌─────────────────────┐    ║
+║  │ POLYMARKET API   │    │ PYTHON STREAMER   │    │ SNOWFLAKE           │    ║
+║  │                  │    │                   │    │                     │    ║
+║  │ gamma-api.       │───▶│ polymarket_       │───▶│ Snowpipe Streaming  │    ║
+║  │ polymarket.com/  │    │ fetcher.py        │    │ v2 REST API         │    ║
+║  │ markets          │    │                   │    │                     │    ║
+║  │                  │    │ snowpipe_         │    │ ┌─────────────────┐ │    ║
+║  │ - 100+ markets   │    │ streaming_        │    │ │ MARKETS table   │ │    ║
+║  │ - Prices         │    │ client.py         │    │ │ (default pipe)  │ │    ║
+║  │ - Volume         │    │                   │    │ │ MARKET_EVENTS   │ │    ║
+║  │ - Categories     │    │ Auth: PAT / JWT   │    │ │ INGESTION_      │ │    ║
+║  │                  │    │                   │    │ │  METRICS        │ │    ║
+║  └─────────────────┘    └──────────────────┘    │ └─────────────────┘ │    ║
+║                                                  │                     │    ║
+║                                                  │ Views:              │    ║
+║                                                  │ V_ACTIVE_MARKETS    │    ║
+║  ┌─────────────────────────────────────────┐    │ V_MARKET_VOLUME_    │    ║
+║  │ REACT DASHBOARD (Next.js)               │    │   SUMMARY           │    ║
+║  │                                         │    │ V_INGESTION_HEALTH  │    ║
+║  │ ┌─────────┐ ┌──────────┐ ┌──────────┐  │◀───│ V_LATEST_MARKETS   │    ║
+║  │ │ Market  │ │ Charts   │ │ Stats    │  │    │                     │    ║
+║  │ │ Cards   │ │ Recharts │ │ KPIs     │  │    └─────────────────────┘    ║
+║  │ │ Table   │ │          │ │          │  │                               ║
+║  │ └─────────┘ └──────────┘ └──────────┘  │                               ║
+║  │                                         │                               ║
+║  │ API Routes: /api/markets                │                               ║
+║  │             /api/streaming              │                               ║
+║  │             /api/export                 │                               ║
+║  └─────────────────────────────────────────┘                               ║
+║                                                                            ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+```
+
+## Features
+
+| Feature | Description | Status |
+|---------|-------------|--------|
+| Snowpipe Streaming v2 | High-Performance REST API (10GB/s capable) | Active |
+| Default Auto-Created Pipe | No `CREATE PIPE` DDL required | Active |
+| PAT + JWT Auth | Programmatic Access Token or Key-Pair | Active |
+| React Dashboard | Next.js 15 + Tailwind CSS 4 + Recharts | Active |
+| Real-time Refresh | 15-second auto-refresh with toggle | Active |
+| Market Cards + Table | Dual view with price bars | Active |
+| Volume Charts | Bar, line, and pie charts by category | Active |
+| Ingestion Health | Streaming metrics monitoring | Active |
+| CSV/JSON Export | Download market data from dashboard | Active |
+| Manage Script | start/stop/install/setup/test/validate | Active |
+| Zod Validation | Type-safe API data validation | Active |
+| Full Test Suite | Python pytest + Jest | Active |
+
+## Data Sources
+
+| Source | Endpoint | Refresh Rate |
+|--------|----------|-------------|
+| Markets | `GET /markets` | 60 seconds (configurable) |
+| Events | Embedded in market response | Per fetch cycle |
+| Metrics | Internal pipeline tracking | Per batch |
+
+API Reference: https://docs.polymarket.com/api-reference/markets/list-markets
+
+## Prerequisites
+
+| Requirement | Version | Notes |
+|-------------|---------|-------|
+| Python | 3.9+ | Streaming client |
+| Node.js | 18+ | React dashboard |
+| Snowflake Account | Any edition | Snowpipe Streaming enabled |
+| npm | 9+ | Package management |
+
+## Quick Start
+
+### 1. Clone & Install
+
+```bash
+git clone <your-repo-url>
+cd polymarket
+
+# Full setup (installs Python + Node deps, validates API)
+./manage.sh setup
+
+# Or install only
+./manage.sh install
+```
+
+### 2. Configure Snowflake
+
+```bash
+# Create Snowflake config for the Python streamer
+cp snowflake_config.example.json snowflake_config.json
+# Edit with your credentials (account, user, PAT or key path)
+```
+
+**snowflake_config.json fields:**
+
+| Field | Description | Example |
+|-------|-------------|---------|
+| `account` | Snowflake account identifier | `myorg-myaccount` |
+| `user` | Snowflake username | `KAFKAGUY` |
+| `database` | Target database | `POLYMARKET` |
+| `schema` | Target schema | `STREAMING` |
+| `table` | Landing table | `MARKETS` |
+| `pipe` | Pipe name (auto-created) | `MARKETS-STREAMING` |
+| `warehouse` | Compute warehouse | `INGEST` |
+| `role` | Snowflake role | `ACCOUNTADMIN` |
+| `pat` | Programmatic Access Token | `ver:1:...` |
+| `private_key_file` | RSA key path (alt to PAT) | `rsa_key.p8` |
+
+### 3. Create Snowflake Tables
+
+Run `SETUP_SNOWFLAKE.sql` in Snowsight or via SnowSQL:
+
+```sql
+-- This creates:
+-- POLYMARKET.STREAMING.MARKETS (landing table)
+-- POLYMARKET.STREAMING.MARKET_EVENTS
+-- POLYMARKET.STREAMING.INGESTION_METRICS
+-- Plus 4 views for the dashboard
+```
+
+### 4. Configure React Dashboard
+
+```bash
+cp .env.example .env.local
+# Edit .env.local with Snowflake credentials for the Node.js app
+```
+
+The dashboard supports three auth methods (choose ONE in `.env.local`):
+
+| Method | Env Variable | Notes |
+|--------|-------------|-------|
+| Key-Pair JWT | `SNOWFLAKE_PRIVATE_KEY_PATH` | Recommended for production |
+| PAT | `SNOWFLAKE_PAT` | Quick start, generate in Snowsight |
+| Password | `SNOWFLAKE_PASSWORD` | Basic auth |
+
+### 5. Start Everything
+
+```bash
+# Start the React dashboard (port 4000)
+./manage.sh start
+
+# Start streaming Polymarket data to Snowflake
+./manage.sh stream
+
+# Check status of all services
+./manage.sh status
+```
+
+Dashboard: http://localhost:4000
+
+## Project Structure
+
+```
+polymarket/
+├── manage.sh                     # Management script (start/stop/install/test)
+├── main.py                       # Main streaming application
+├── polymarket_fetcher.py         # Polymarket API client & data transformer
+├── snowpipe_streaming_client.py  # Snowpipe Streaming v2 REST API client
+├── snowflake_jwt_auth.py         # JWT/PAT authentication module
+├── validation.py                 # Pipeline validation checks
+├── test_polymarket.py            # Python test suite
+├── SETUP_SNOWFLAKE.sql           # Snowflake DDL (tables, views, grants)
+├── snowflake_config.example.json # Snowflake config template
+├── .env.example                  # React app env template
+├── .gitignore                    # Git ignore rules
+├── requirements.txt              # Python dependencies
+├── pyproject.toml                # Python project metadata
+├── package.json                  # Node.js dependencies
+├── tsconfig.json                 # TypeScript configuration
+├── next.config.ts                # Next.js configuration
+├── postcss.config.mjs            # PostCSS / Tailwind config
+├── jest.config.js                # Jest test configuration
+├── README.md                     # This file
+│
+├── app/                          # Next.js App Router
+│   ├── layout.tsx                # Root layout
+│   ├── page.tsx                  # Main dashboard page
+│   ├── globals.css               # Global styles (Tailwind)
+│   ├── api/
+│   │   ├── markets/route.ts      # GET /api/markets
+│   │   ├── streaming/route.ts    # GET /api/streaming (metrics)
+│   │   └── export/route.ts       # POST /api/export (CSV/JSON)
+│   └── components/
+│       ├── charts.tsx            # StatCard, VolumeByCategoryChart, etc.
+│       └── market-cards.tsx      # MarketCard, MarketTable
+│
+├── lib/                          # Shared libraries
+│   ├── snowflake.ts              # Snowflake connection pool
+│   ├── utils.ts                  # Utility functions (cn, formatNumber)
+│   └── validations.ts            # Zod schemas, type definitions
+│
+├── __tests__/                    # Jest tests
+│   └── utils.test.ts             # Utility function tests
+│
+└── scripts/                      # Helper scripts
+```
+
+## manage.sh Commands Reference
+
+### Dashboard
+
+| Command | Description |
+|---------|-------------|
+| `./manage.sh install` | Install Python + Node.js dependencies |
+| `./manage.sh setup` | Full setup: install, validate API, check config |
+| `./manage.sh start` | Start React dashboard in background (port 4000) |
+| `./manage.sh stop` | Stop the React dashboard |
+| `./manage.sh restart` | Restart the React dashboard |
+| `./manage.sh status` | Check status of all services |
+| `./manage.sh dev` | Start dashboard in foreground (interactive) |
+| `./manage.sh build` | Build React app for production |
+| `./manage.sh prod` | Start production server |
+
+### Streaming
+
+| Command | Description |
+|---------|-------------|
+| `./manage.sh stream` | Start continuous streaming (background, 60s interval) |
+| `./manage.sh stream-once` | Single fetch-and-stream cycle |
+| `./manage.sh stream-stop` | Stop background streamer |
+| `./manage.sh stream-logs` | Show streamer log output |
+
+### Testing & Validation
+
+| Command | Description |
+|---------|-------------|
+| `./manage.sh test` | Run all tests (Python + Jest) |
+| `./manage.sh validate` | Run full pipeline validation |
+| `./manage.sh test-api` | Test Polymarket API connectivity |
+| `./manage.sh test-auth` | Test Snowflake authentication |
+| `./manage.sh check-data` | Check Snowflake streaming client config |
+
+### Maintenance
+
+| Command | Description |
+|---------|-------------|
+| `./manage.sh logs` | Show dashboard server logs |
+| `./manage.sh clean` | Remove build artifacts, node_modules, venv |
+
+## Authentication
+
+The Python streaming client supports two methods:
+
+### Option 1: Programmatic Access Token (PAT) - Recommended
+
+Generate a PAT in Snowsight under **User Menu > Preferences > Authentication > Programmatic Access Tokens**.
+
+```json
+{
+  "pat": "ver:1:your_token_here"
+}
+```
+
+### Option 2: JWT Key-Pair Authentication
+
+```bash
+# Generate RSA key pair
+openssl genrsa 2048 | openssl pkcs8 -topk8 -inform PEM -out rsa_key.p8 -nocrypt
+openssl rsa -in rsa_key.p8 -pubout -out rsa_key.pub
+
+# Register public key with Snowflake user
+ALTER USER your_user SET RSA_PUBLIC_KEY='<paste public key body>';
+```
+
+```json
+{
+  "private_key_file": "rsa_key.p8"
+}
+```
+
+## Snowpipe Streaming v2 Concepts
+
+### Default Pipe
+
+The high-performance architecture auto-creates a **default pipe** for every table. No `CREATE PIPE` DDL is required.
+
+- **Naming convention**: `TABLE_NAME-STREAMING` (hyphen, not underscore)
+- **Example**: Table `MARKETS` → Pipe `MARKETS-STREAMING`
+- The pipe is created on-demand at first successful channel open
+
+### Data Flow
+
+1. Python client calls `GET /v2/streaming/hostname` to discover the ingest endpoint
+2. Opens a channel via `PUT /v2/streaming/.../pipes/MARKETS-STREAMING/channels/...`
+3. Appends rows as NDJSON via `POST /v2/streaming/data/.../rows`
+4. Data appears in the table within 5-10 seconds
+
+### Billing
+
+Throughput-based billing. See [Snowpipe Streaming costs](https://docs.snowflake.com/en/user-guide/snowpipe-streaming/snowpipe-streaming-high-performance-overview).
+
+## Snowflake Schema
+
+### MARKETS Table (Landing)
+
+| Column | Type | Description |
+|--------|------|-------------|
+| id | VARCHAR(255) | Market ID from Polymarket |
+| question | VARCHAR(4000) | Market question text |
+| category | VARCHAR(255) | Category (Politics, Crypto, etc.) |
+| outcomes | VARCHAR(4000) | JSON array of outcome names |
+| outcome_prices | VARCHAR(4000) | JSON array of prices (0-1) |
+| volume_num | FLOAT | Total trading volume |
+| volume_24hr | FLOAT | 24-hour trading volume |
+| liquidity_num | FLOAT | Available liquidity |
+| spread | FLOAT | Bid-ask spread |
+| active | BOOLEAN | Market is active |
+| closed | BOOLEAN | Market is closed |
+| end_date | TIMESTAMP_NTZ | Market end date |
+| ingested_at | TIMESTAMP_TZ | When streamed to Snowflake |
+| batch_id | VARCHAR(100) | Ingestion batch identifier |
+
+### Views
+
+| View | Description |
+|------|-------------|
+| `V_ACTIVE_MARKETS` | Active, non-closed markets ordered by volume |
+| `V_LATEST_MARKETS` | Latest snapshot per market (deduplicated) |
+| `V_MARKET_VOLUME_SUMMARY` | Volume aggregated by category |
+| `V_INGESTION_HEALTH` | Streaming metrics by minute |
+
+## API Endpoints (React Dashboard)
+
+| Endpoint | Method | Cache | Description |
+|----------|--------|-------|-------------|
+| `/api/markets` | GET | 15s | Active markets with prices and volume |
+| `/api/streaming` | GET | 30s | Volume summary, ingestion health, totals |
+| `/api/export` | POST | — | Export data as CSV or JSON |
+
+### `/api/markets` Query Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `limit` | 100 | Max markets to return (max 500) |
+| `category` | — | Filter by category |
+| `active` | `true` | Filter active markets |
+
+### `/api/export` Request Body
+
+```json
+{
+  "data": [{"id": "1", "question": "..."}],
+  "filename": "polymarket_export",
+  "format": "csv"
+}
+```
+
+## Python Streaming Client Usage
+
+### Continuous mode (default)
+
+```bash
+python main.py --interval 60 --pages 5 --batch-size 50
+```
+
+### Single run
+
+```bash
+python main.py --once --pages 3
+```
+
+### CLI Arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--config` | `snowflake_config.json` | Config file path |
+| `--once` | false | Single cycle then exit |
+| `--interval` | 60 | Seconds between cycles |
+| `--pages` | 5 | Max API pages per cycle |
+| `--batch-size` | 50 | Rows per streaming batch |
+
+## Testing
+
+```bash
+# All tests
+./manage.sh test
+
+# Python tests only
+python -m pytest test_polymarket.py -v
+
+# Jest tests only
+npm test
+
+# Pipeline validation
+./manage.sh validate
+
+# Polymarket API check
+./manage.sh test-api
+```
+
+## Troubleshooting
+
+| Issue | Cause | Fix |
+|-------|-------|-----|
+| `Connection refused` | Account URL incorrect | Verify `account` in config |
+| `401 Unauthorized` on `/oauth/token` | JWT fingerprint mismatch | Ensure RSA public key is registered: `ALTER USER ... SET RSA_PUBLIC_KEY=...` |
+| `400 Bad Request` on `/oauth/token` | Duplicate token exchange | Update to latest `snowpipe_streaming_client.py` (uses single auth flow) |
+| `Authentication failed` | Invalid PAT or RSA key | Check `pat` value or re-register public key |
+| `Table not found` | DDL not run | Execute `SETUP_SNOWFLAKE.sql` |
+| `Rate limited (429)` | Too many API calls | Increase `--interval`, fetcher has retry logic |
+| `Empty markets` | API pagination | Check Polymarket API status |
+| Dashboard shows no data | Streamer not running | Run `./manage.sh stream` first |
+| Ingestion Health chart empty | `INGESTION_METRICS` table has no rows | The Python streamer writes metrics each cycle. Run `./manage.sh stream` or `./manage.sh stream-once` |
+| "Pipeline Offline" banner | No recent ingestion detected | Start the streamer: `./manage.sh stream`. The dashboard checks `LAST_INGESTED` from `V_LATEST_MARKETS` |
+| "Pipeline Stale" warning | Streamer stopped or lagging | Restart with `./manage.sh stream-stop && ./manage.sh stream`. Check `./manage.sh stream-logs` for errors |
+| Inflated volume numbers | `V_MARKET_VOLUME_SUMMARY` querying raw table | Re-run `SETUP_SNOWFLAKE.sql` to update the view to use `V_LATEST_MARKETS` |
+| Dashboard connection drops | Stale Snowflake connection cached | The dashboard auto-reconnects on connection errors. Restart if persistent: `./manage.sh restart` |
+| `Snowflake not configured` | Missing `.env.local` | Copy `.env.example` to `.env.local` and set credentials |
+| `ModuleNotFoundError` | Venv not activated | Run `source venv/bin/activate` |
+
+## Tech Stack
+
+| Layer | Technology |
+|-------|-----------|
+| Data Source | Polymarket Gamma API |
+| Streaming | Snowpipe Streaming v2 High-Performance REST API |
+| Data Warehouse | Snowflake |
+| Auth | PAT / JWT Key-Pair |
+| Backend | Next.js 15 API Routes |
+| Frontend | React 19, Tailwind CSS 4, Recharts |
+| Validation | Zod (TypeScript), pytest (Python) |
+| Testing | Jest + ts-jest, pytest |
+
+## References
+
+- [Snowpipe Streaming v2 Overview](https://docs.snowflake.com/en/user-guide/snowpipe-streaming/snowpipe-streaming-high-performance-overview)
+- [Polymarket API Docs](https://docs.polymarket.com/api-reference/markets/list-markets)
+- [Snowflake PAT Auth](https://docs.snowflake.com/en/user-guide/authentication-programmatic-tokens)
+- [Snowflake JWT Auth](https://docs.snowflake.com/en/developer-guide/sql-api/guide#using-key-pair-authentication)
+- [SNACKAI-CoCo-NYC-OPSCenter](https://github.com/tspannhw/SNACKAI-CoCo-NYC-OPSCenter)
+- [SNACKAI-CoCo-Meshtastic](https://github.com/tspannhw/SNACKAI-CoCo-Meshtastic)
+- [NYC Camera Pipeline](https://github.com/tspannhw/nyccamera)
+
+## License
+
+Apache-2.0
