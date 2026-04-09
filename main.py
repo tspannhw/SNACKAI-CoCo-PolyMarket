@@ -54,7 +54,8 @@ def stream_markets(
     client: SnowpipeStreamingClient,
     fetcher: PolymarketFetcher,
     max_pages: int = 5,
-    batch_size: int = 50
+    batch_size: int = 50,
+    events_client: SnowpipeStreamingClient = None
 ) -> dict:
     """
     Fetch markets from Polymarket and stream to Snowflake.
@@ -97,9 +98,20 @@ def stream_markets(
                 metrics['errors'] += 1
                 client.stats['errors'] += 1
 
-        # Stream events (if any) - would need a separate channel/client for MARKET_EVENTS table
-        # For now, log event count
-        metrics['events_streamed'] = len(events)
+        # Stream events via dedicated events client (SSv2 binds one channel per table)
+        if events_client and events:
+            events_streamed = 0
+            for i in range(0, len(events), batch_size):
+                event_batch = events[i:i + batch_size]
+                try:
+                    events_client.append_rows(event_batch)
+                    events_streamed += len(event_batch)
+                except Exception as e:
+                    logger.error(f"Failed to stream event batch {i}: {e}")
+                    metrics['errors'] += 1
+            metrics['events_streamed'] = events_streamed
+        else:
+            metrics['events_streamed'] = len(events)
 
         metrics['stream_duration_ms'] = (time.time() - stream_start) * 1000
         metrics['total_duration_ms'] = (time.time() - start_time) * 1000
@@ -124,6 +136,27 @@ def stream_markets(
         metrics['errors'] += 1
 
     return metrics
+
+
+def create_events_client(config_path: str) -> SnowpipeStreamingClient:
+    """
+    Create a separate streaming client for the MARKET_EVENTS table.
+
+    SSv2 binds one channel to one table, so we need a dedicated client
+    instance for events that targets MARKET_EVENTS instead of MARKETS.
+    """
+    with open(config_path, 'r') as f:
+        events_config = json.load(f)
+
+    events_config['table'] = 'MARKET_EVENTS'
+    events_config['pipe'] = 'MARKET_EVENTS-STREAMING'
+    events_config['channel_name'] = 'EVENTS'
+
+    events_config_path = config_path.replace('.json', '_events.json')
+    with open(events_config_path, 'w') as f:
+        json.dump(events_config, f, indent=2)
+
+    return SnowpipeStreamingClient(events_config_path)
 
 
 def create_metrics_client(config_path: str) -> SnowpipeStreamingClient:
@@ -211,6 +244,16 @@ def run_continuous(
         logger.error("Check your snowflake_config.json and authentication settings")
         sys.exit(1)
 
+    # Initialize a separate client for streaming events to MARKET_EVENTS table
+    events_client = None
+    try:
+        events_client = create_events_client(config_path)
+        events_client.discover_ingest_host()
+        events_client.open_channel()
+        logger.info("Events streaming client initialized")
+    except Exception as e:
+        logger.warning(f"Could not initialize events client (events will not be streamed): {e}")
+
     # Initialize a separate client for streaming ingestion metrics
     metrics_client = None
     try:
@@ -226,7 +269,7 @@ def run_continuous(
         cycle += 1
         logger.info(f"\n--- Cycle {cycle} ---")
 
-        metrics = stream_markets(client, fetcher, max_pages=max_pages, batch_size=batch_size)
+        metrics = stream_markets(client, fetcher, max_pages=max_pages, batch_size=batch_size, events_client=events_client)
 
         # Attach client stats for observability logging in metrics streaming
         metrics['client_stats'] = client.stats.copy()
@@ -245,6 +288,8 @@ def run_continuous(
     # Shutdown
     logger.info("Shutting down...")
     client.close_channel()
+    if events_client:
+        events_client.close_channel()
     if metrics_client:
         metrics_client.close_channel()
     logger.info("Streaming stopped.")
@@ -270,6 +315,15 @@ def run_once(
         logger.error(f"Failed to initialize streaming client: {e}")
         sys.exit(1)
 
+    # Initialize events client for streaming to MARKET_EVENTS table
+    events_client = None
+    try:
+        events_client = create_events_client(config_path)
+        events_client.discover_ingest_host()
+        events_client.open_channel()
+    except Exception as e:
+        logger.warning(f"Could not initialize events client: {e}")
+
     # Initialize metrics client for tracking ingestion health
     metrics_client = None
     try:
@@ -279,7 +333,7 @@ def run_once(
     except Exception as e:
         logger.warning(f"Could not initialize metrics client: {e}")
 
-    metrics = stream_markets(client, fetcher, max_pages=max_pages, batch_size=batch_size)
+    metrics = stream_markets(client, fetcher, max_pages=max_pages, batch_size=batch_size, events_client=events_client)
 
     # Stream ingestion metrics so dashboard can display pipeline health
     if metrics_client:
@@ -287,6 +341,8 @@ def run_once(
         metrics_client.close_channel()
 
     client.close_channel()
+    if events_client:
+        events_client.close_channel()
 
     print(f"\nResults:")
     print(f"  Batch ID:         {metrics['batch_id']}")

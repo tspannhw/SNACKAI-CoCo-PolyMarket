@@ -598,5 +598,92 @@ class TestStreamingClientRetry:
                 assert result == {'next_continuation_token': 'ct-new'}
 
 
+class TestEventsStreaming:
+    """Tests for MARKET_EVENTS streaming via dedicated events client."""
+
+    def test_events_client_targets_market_events_table(self):
+        """Test that create_events_client targets MARKET_EVENTS table."""
+        from main import create_events_client
+        import tempfile, os
+
+        config = {
+            'account': 'testorg-testacct',
+            'user': 'TESTUSER',
+            'database': 'POLYMARKET',
+            'schema': 'STREAMING',
+            'table': 'MARKETS',
+            'pat': 'ver:1:test',
+        }
+        config_path = os.path.join(tempfile.gettempdir(), 'test_sf_config.json')
+        with open(config_path, 'w') as f:
+            json.dump(config, f)
+
+        with patch('snowpipe_streaming_client.SnowflakeJWTAuth'):
+            client = create_events_client(config_path)
+            assert client.table == 'MARKET_EVENTS'
+            assert client.pipe == 'MARKET_EVENTS-STREAMING'
+            assert 'EVENTS' in client.channel_name
+
+        # Cleanup
+        os.remove(config_path)
+        events_path = config_path.replace('.json', '_events.json')
+        if os.path.exists(events_path):
+            os.remove(events_path)
+
+    def test_stream_markets_streams_events(self):
+        """Test that stream_markets sends events via events_client."""
+        from main import stream_markets
+
+        mock_fetcher = MagicMock()
+        mock_fetcher.fetch_and_transform.return_value = (
+            [{'id': 'm1', 'question': 'Q1'}],
+            [{'event_id': 'e1', 'title': 'Event 1'}],
+            'batch_test_001',
+        )
+
+        mock_markets_client = MagicMock()
+        mock_markets_client.stats = {'errors': 0}
+        mock_markets_client.check_channel_health.return_value = True
+
+        mock_events_client = MagicMock()
+
+        metrics = stream_markets(
+            mock_markets_client, mock_fetcher,
+            max_pages=1, batch_size=50,
+            events_client=mock_events_client,
+        )
+
+        # Events client should have been called with the event rows
+        mock_events_client.append_rows.assert_called_once()
+        event_rows = mock_events_client.append_rows.call_args[0][0]
+        assert len(event_rows) == 1
+        assert event_rows[0]['event_id'] == 'e1'
+        assert metrics['events_streamed'] == 1
+
+    def test_stream_markets_no_events_client_graceful(self):
+        """Test that events are counted but not streamed when events_client is None."""
+        from main import stream_markets
+
+        mock_fetcher = MagicMock()
+        mock_fetcher.fetch_and_transform.return_value = (
+            [{'id': 'm1', 'question': 'Q1'}],
+            [{'event_id': 'e1', 'title': 'Event 1'}, {'event_id': 'e2', 'title': 'Event 2'}],
+            'batch_test_002',
+        )
+
+        mock_client = MagicMock()
+        mock_client.stats = {'errors': 0}
+        mock_client.check_channel_health.return_value = True
+
+        metrics = stream_markets(
+            mock_client, mock_fetcher,
+            max_pages=1, batch_size=50,
+            events_client=None,
+        )
+
+        # events_streamed should reflect found count (not actually streamed)
+        assert metrics['events_streamed'] == 2
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

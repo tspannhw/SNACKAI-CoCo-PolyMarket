@@ -334,7 +334,8 @@ Throughput-based billing. See [Snowpipe Streaming costs](https://docs.snowflake.
 | `V_LATEST_MARKETS` | Latest snapshot per market (deduplicated) |
 | `V_MARKET_VOLUME_SUMMARY` | Volume aggregated by category |
 | `V_INGESTION_HEALTH` | Streaming metrics by minute |
-| `V_STREAMING_CHANNEL_HEALTH` | SSv2 channel errors, latency, row counts |
+| `V_STREAMING_CHANNEL_HEALTH` | SSv2 channel errors, latency, row counts (ACCOUNT_USAGE, may have lag) |
+| `V_STREAMING_OPERATIONAL_HEALTH` | Real-time pipeline status per table (HEALTHY/STALE/OFFLINE) |
 
 ### Row Timestamps (METADATA$ROW_LAST_COMMIT_TIME)
 
@@ -376,7 +377,7 @@ Error tables are auto-created by Snowflake when errors occur. If no errors have 
 
 ### Channel Monitoring
 
-The `V_STREAMING_CHANNEL_HEALTH` view provides a convenient dashboard over `SNOWFLAKE.ACCOUNT_USAGE.SNOWPIPE_STREAMING_CHANNEL_HISTORY`:
+The `V_STREAMING_CHANNEL_HEALTH` view provides a dashboard over `SNOWFLAKE.ACCOUNT_USAGE.SNOWPIPE_STREAMING_CHANNEL_HISTORY`:
 
 ```sql
 -- Check channel health, errors, and latency
@@ -385,7 +386,20 @@ SELECT * FROM POLYMARKET.STREAMING.V_STREAMING_CHANNEL_HEALTH LIMIT 10;
 
 Key columns: `ROWS_INSERTED`, `ROWS_PARSED`, `ROW_ERROR_COUNT`, `LAST_ERROR_MESSAGE`, `SNOWFLAKE_PROCESSING_LATENCY_MS`.
 
-**SSv2 Default Pipe Visibility**: The auto-created pipes (`MARKETS-STREAMING`, `INGESTION_METRICS-STREAMING`) are Snowflake-managed (`is_snowflake_managed=true`, `owner=NULL`). ACCOUNTADMIN can see them via `SHOW PIPES IN SCHEMA POLYMARKET.STREAMING` but GRANT MONITOR is not supported on managed pipes.
+**Note**: ACCOUNT_USAGE views have up to 45-minute latency and may take longer to populate for SSv2 High-Performance channels. If `V_STREAMING_CHANNEL_HEALTH` returns 0 rows, use the operational health view instead.
+
+### Operational Health (Real-Time)
+
+The `V_STREAMING_OPERATIONAL_HEALTH` view provides real-time pipeline status by querying table data directly (no ACCOUNT_USAGE dependency):
+
+```sql
+-- Real-time status of all three streaming tables
+SELECT * FROM POLYMARKET.STREAMING.V_STREAMING_OPERATIONAL_HEALTH;
+```
+
+Returns one row per table (MARKETS, MARKET_EVENTS, INGESTION_METRICS) with: `row_count`, `batch_count`, `last_ingested`, `seconds_since_last`, `pipeline_status` (HEALTHY/STALE/OFFLINE).
+
+**SSv2 Default Pipe Visibility**: The auto-created pipes (`MARKETS-STREAMING`, `MARKET_EVENTS-STREAMING`, `INGESTION_METRICS-STREAMING`) are Snowflake-managed (`is_snowflake_managed=true`, `owner=NULL`). ACCOUNTADMIN can see them via `SHOW PIPES IN SCHEMA POLYMARKET.STREAMING` but GRANT MONITOR is not supported on managed pipes.
 
 ### SSv2 Client Error Handling
 
@@ -435,14 +449,21 @@ The Python streaming client (`snowpipe_streaming_client.py`) implements the full
 
 ### MARKET_EVENTS Table
 
+Events are parent objects that group related markets. Populated via a dedicated SSv2 channel targeting the `MARKET_EVENTS-STREAMING` default pipe. Events are extracted from the embedded `events` array in each market API response and deduplicated by event_id.
+
 | Column | Type | Description |
 |--------|------|-------------|
 | event_id | VARCHAR(255) | Event ID from Polymarket |
-| event_title | VARCHAR(4000) | Event title text |
-| event_slug | VARCHAR(1000) | URL-safe event slug |
-| market_id | VARCHAR(255) | FK to MARKETS.id |
-| category | VARCHAR(255) | Category (mirrors market) |
+| ticker | VARCHAR(255) | Event ticker symbol |
+| slug | VARCHAR(1000) | URL-safe event slug |
+| title | VARCHAR(4000) | Event title text |
+| description | VARCHAR(16000) | Event description |
+| category | VARCHAR(255) | Event category |
+| start_date | TIMESTAMP_NTZ | Event start date |
 | end_date | TIMESTAMP_NTZ | Event end date |
+| volume | FLOAT | Total event volume across all markets (USD) |
+| liquidity | FLOAT | Total event liquidity (USD) |
+| market_count | INTEGER | Number of markets in this event |
 | ingested_at | TIMESTAMP_TZ | When streamed to Snowflake |
 | batch_id | VARCHAR(100) | Ingestion batch identifier |
 
@@ -464,11 +485,12 @@ Each streaming cycle in `main.py` produces one row in `INGESTION_METRICS`:
 
 ```
 Polymarket API → fetch markets → transform → stream to MARKETS table
+                                           → stream to MARKET_EVENTS table
                                            → compute metrics
                                            → stream to INGESTION_METRICS table
 ```
 
-The metrics are streamed via a **separate SSv2 client** (one channel per table is required by SSv2). The dashboard's `/api/streaming` route reads `V_INGESTION_HEALTH` to show batch history, throughput, and error rates.
+The markets, events, and metrics are each streamed via **separate SSv2 clients** (one channel per table is required by SSv2). Events are extracted from the embedded `events` array in each market API response and deduplicated by event_id. The dashboard's `/api/streaming` route reads `V_INGESTION_HEALTH` to show batch history, throughput, and error rates.
 
 ### Connection Recovery
 
@@ -550,7 +572,7 @@ npm test
 
 ### Test Coverage
 
-**Python tests** (`test_polymarket.py` — 29 tests):
+**Python tests** (`test_polymarket.py` — 32 tests):
 
 | Test Class | Tests | What It Covers |
 |------------|-------|----------------|
@@ -560,6 +582,7 @@ npm test
 | `TestMetricsRow` | 3 | Metrics row structure, error rows, failure isolation |
 | `TestStreamingClient` | 3 | Client init, auth selection, row serialization |
 | `TestStreamingClientRetry` | 10 | HTTP retry (429/5XX), channel reopen (409), token refresh, connection pooling, channel health |
+| `TestEventsStreaming` | 3 | Events client creation, events streaming via SSv2, graceful fallback without events client |
 
 **Jest tests** (`__tests__/utils.test.ts` — 28 tests):
 
@@ -611,6 +634,8 @@ Run via `./manage.sh validate` or `python validation.py`:
 | `ERR_CHANNEL_MUST_BE_REOPENED` | Fatal channel error | Client auto-detects via `check_channel_health()` and reopens. Check `V_STREAMING_CHANNEL_HEALTH` for details |
 | Token expiry mid-batch | OAuth token expired | Client proactively refreshes tokens 5 min before expiry. If using PAT, ensure it hasn't been revoked |
 | Streaming errors not captured | `ERROR_LOGGING` not enabled | Run `ALTER TABLE ... SET ERROR_LOGGING = TRUE` (see `SETUP_SNOWFLAKE.sql` Section 3c) |
+| `MARKET_EVENTS` table empty | Events not streamed (pre-v1.1) | Update `main.py` to latest version with `create_events_client()`. Run `./manage.sh stream-once` to populate |
+| `V_STREAMING_CHANNEL_HEALTH` empty | ACCOUNT_USAGE latency | ACCOUNT_USAGE views can take hours to populate for SSv2 HP channels. Use `V_STREAMING_OPERATIONAL_HEALTH` for real-time status |
 
 ## Tech Stack
 

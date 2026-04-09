@@ -17,22 +17,26 @@
 --
 --   TABLES (3):
 --     MARKETS            - Landing table for market data (SSv2 default pipe)
---     MARKET_EVENTS      - Event data extracted from markets
+--     MARKET_EVENTS      - Event data extracted from markets (SSv2 default pipe)
 --     INGESTION_METRICS  - Pipeline performance tracking (SSv2 default pipe)
 --
---   VIEWS (4):
---     V_ACTIVE_MARKETS        - Active, non-closed markets
---     V_LATEST_MARKETS        - Deduplicated latest snapshot per market
---     V_MARKET_VOLUME_SUMMARY - Volume aggregated by category
---     V_INGESTION_HEALTH      - Streaming metrics bucketed by minute
+--   VIEWS (6):
+--     V_ACTIVE_MARKETS              - Active, non-closed markets
+--     V_LATEST_MARKETS              - Deduplicated latest snapshot per market
+--     V_MARKET_VOLUME_SUMMARY       - Volume aggregated by category
+--     V_INGESTION_HEALTH            - Streaming metrics bucketed by minute
+--     V_STREAMING_CHANNEL_HEALTH    - SSv2 channel errors/latency (ACCOUNT_USAGE)
+--     V_STREAMING_OPERATIONAL_HEALTH- Real-time pipeline status per table
 --
 -- Data Flow:
 --   Polymarket API -> Python Fetcher -> SSv2 REST API -> MARKETS table
+--                                    -> SSv2 REST API -> MARKET_EVENTS table
 --                                    -> SSv2 REST API -> INGESTION_METRICS table
 --   Dashboard (Next.js) -> Snowflake SDK -> Views -> React UI
 --
 -- SSv2 Default Pipes (auto-created, no DDL needed):
 --   MARKETS            -> MARKETS-STREAMING
+--   MARKET_EVENTS      -> MARKET_EVENTS-STREAMING
 --   INGESTION_METRICS  -> INGESTION_METRICS-STREAMING
 --
 -- Usage:
@@ -149,8 +153,10 @@ ROW_TIMESTAMP = TRUE;
 -- For example, "2024 US Presidential Election" is an event
 -- containing multiple markets (winner, popular vote, etc.).
 --
--- NOTE: Events are currently collected by the fetcher but not
--- yet streamed to Snowflake. This table is ready for future use.
+-- Populated by main.py via a dedicated SSv2 channel targeting
+-- the MARKET_EVENTS-STREAMING default pipe. Events are extracted
+-- from the embedded 'events' array in each market API response
+-- and deduplicated by event_id before streaming.
 -- ------------------------------------------------------------
 CREATE OR REPLACE TABLE POLYMARKET.STREAMING.MARKET_EVENTS (
     event_id              VARCHAR(255)    COMMENT 'Polymarket event ID',
@@ -174,7 +180,7 @@ CREATE OR REPLACE TABLE POLYMARKET.STREAMING.MARKET_EVENTS (
                                           COMMENT 'When this row was ingested',
     batch_id              VARCHAR(100)    COMMENT 'Ingestion batch identifier'
 )
-COMMENT = 'Polymarket events (parent groupings of related markets). Reserved for future streaming.'
+COMMENT = 'Polymarket events (parent groupings of related markets). Streamed via SSv2 MARKET_EVENTS-STREAMING pipe.'
 ROW_TIMESTAMP = TRUE;
 
 
@@ -285,6 +291,11 @@ ALTER TABLE POLYMARKET.STREAMING.INGESTION_METRICS SET ERROR_LOGGING = TRUE;
 -- ============================================================
 -- Provides a convenient view over SNOWPIPE_STREAMING_CHANNEL_HISTORY
 -- for monitoring channel health, errors, and latency.
+--
+-- NOTE: ACCOUNT_USAGE views have up to 45-minute latency and may
+-- take longer to populate for SSv2 High-Performance channels.
+-- If this view returns 0 rows, use V_STREAMING_OPERATIONAL_HEALTH
+-- (Section 3e) for real-time pipeline status based on table data.
 -- ============================================================
 
 CREATE OR REPLACE VIEW POLYMARKET.STREAMING.V_STREAMING_CHANNEL_HEALTH AS
@@ -303,6 +314,71 @@ FROM SNOWFLAKE.ACCOUNT_USAGE.SNOWPIPE_STREAMING_CHANNEL_HISTORY
 WHERE TABLE_DATABASE_NAME = 'POLYMARKET'
   AND TABLE_SCHEMA_NAME = 'STREAMING'
 ORDER BY CREATED_ON DESC;
+
+
+-- ============================================================
+-- SECTION 3e: OPERATIONAL HEALTH VIEW (real-time)
+-- ============================================================
+-- Unlike V_STREAMING_CHANNEL_HEALTH (which depends on ACCOUNT_USAGE
+-- latency), this view derives pipeline health directly from table
+-- data. It shows row counts, last ingestion time, and a status
+-- classification for each streaming table.
+--
+-- Status logic:
+--   HEALTHY  = last ingestion < 3 minutes ago
+--   STALE    = last ingestion 3-10 minutes ago
+--   OFFLINE  = last ingestion > 10 minutes ago or no data
+-- ============================================================
+
+CREATE OR REPLACE VIEW POLYMARKET.STREAMING.V_STREAMING_OPERATIONAL_HEALTH AS
+SELECT
+    'MARKETS' AS table_name,
+    COUNT(*) AS row_count,
+    COUNT(DISTINCT batch_id) AS batch_count,
+    MAX(ingested_at) AS last_ingested,
+    DATEDIFF('second', MAX(ingested_at), CURRENT_TIMESTAMP()) AS seconds_since_last,
+    MAX(batch_id) AS latest_batch_id,
+    CASE
+        WHEN MAX(ingested_at) IS NULL THEN 'OFFLINE'
+        WHEN DATEDIFF('minute', MAX(ingested_at), CURRENT_TIMESTAMP()) < 3 THEN 'HEALTHY'
+        WHEN DATEDIFF('minute', MAX(ingested_at), CURRENT_TIMESTAMP()) < 10 THEN 'STALE'
+        ELSE 'OFFLINE'
+    END AS pipeline_status
+FROM POLYMARKET.STREAMING.MARKETS
+
+UNION ALL
+
+SELECT
+    'MARKET_EVENTS' AS table_name,
+    COUNT(*) AS row_count,
+    COUNT(DISTINCT batch_id) AS batch_count,
+    MAX(ingested_at) AS last_ingested,
+    DATEDIFF('second', MAX(ingested_at), CURRENT_TIMESTAMP()) AS seconds_since_last,
+    MAX(batch_id) AS latest_batch_id,
+    CASE
+        WHEN MAX(ingested_at) IS NULL THEN 'OFFLINE'
+        WHEN DATEDIFF('minute', MAX(ingested_at), CURRENT_TIMESTAMP()) < 3 THEN 'HEALTHY'
+        WHEN DATEDIFF('minute', MAX(ingested_at), CURRENT_TIMESTAMP()) < 10 THEN 'STALE'
+        ELSE 'OFFLINE'
+    END AS pipeline_status
+FROM POLYMARKET.STREAMING.MARKET_EVENTS
+
+UNION ALL
+
+SELECT
+    'INGESTION_METRICS' AS table_name,
+    COUNT(*) AS row_count,
+    COUNT(DISTINCT batch_id) AS batch_count,
+    MAX(ingested_at) AS last_ingested,
+    DATEDIFF('second', MAX(ingested_at), CURRENT_TIMESTAMP()) AS seconds_since_last,
+    MAX(batch_id) AS latest_batch_id,
+    CASE
+        WHEN MAX(ingested_at) IS NULL THEN 'OFFLINE'
+        WHEN DATEDIFF('minute', MAX(ingested_at), CURRENT_TIMESTAMP()) < 3 THEN 'HEALTHY'
+        WHEN DATEDIFF('minute', MAX(ingested_at), CURRENT_TIMESTAMP()) < 10 THEN 'STALE'
+        ELSE 'OFFLINE'
+    END AS pipeline_status
+FROM POLYMARKET.STREAMING.INGESTION_METRICS;
 
 
 -- ============================================================
@@ -449,7 +525,11 @@ SELECT 'V_LATEST_MARKETS',                     COUNT(*) FROM POLYMARKET.STREAMIN
 UNION ALL
 SELECT 'V_MARKET_VOLUME_SUMMARY',              COUNT(*) FROM POLYMARKET.STREAMING.V_MARKET_VOLUME_SUMMARY
 UNION ALL
-SELECT 'V_INGESTION_HEALTH',                   COUNT(*) FROM POLYMARKET.STREAMING.V_INGESTION_HEALTH;
+SELECT 'V_INGESTION_HEALTH',                   COUNT(*) FROM POLYMARKET.STREAMING.V_INGESTION_HEALTH
+UNION ALL
+SELECT 'V_STREAMING_CHANNEL_HEALTH',           COUNT(*) FROM POLYMARKET.STREAMING.V_STREAMING_CHANNEL_HEALTH
+UNION ALL
+SELECT 'V_STREAMING_OPERATIONAL_HEALTH',       COUNT(*) FROM POLYMARKET.STREAMING.V_STREAMING_OPERATIONAL_HEALTH;
 
 
 -- 5f. Verify SSv2 default pipes are visible
@@ -480,6 +560,9 @@ LIMIT 10;
 -- If no errors have occurred yet, this returns 0 rows (expected).
 SELECT 'MARKETS errors' AS check_name, COUNT(*) AS error_rows
 FROM TABLE(POLYMARKET.INFORMATION_SCHEMA.STREAMING_ERROR_LOG('STREAMING.MARKETS'));
+
+-- 5j. Check operational health (real-time pipeline status per table)
+SELECT * FROM POLYMARKET.STREAMING.V_STREAMING_OPERATIONAL_HEALTH;
 
 
 -- ============================================================
@@ -600,9 +683,9 @@ LIMIT 10;
 --
 -- Components created:
 --   TABLES (3): MARKETS, MARKET_EVENTS, INGESTION_METRICS
---   VIEWS  (5): V_LATEST_MARKETS, V_ACTIVE_MARKETS,
+--   VIEWS  (6): V_LATEST_MARKETS, V_ACTIVE_MARKETS,
 --               V_MARKET_VOLUME_SUMMARY, V_INGESTION_HEALTH,
---               V_STREAMING_CHANNEL_HEALTH
+--               V_STREAMING_CHANNEL_HEALTH, V_STREAMING_OPERATIONAL_HEALTH
 --
 -- Features enabled:
 --   ROW_TIMESTAMP = TRUE        (all tables)
@@ -611,9 +694,11 @@ LIMIT 10;
 --
 -- SSv2 Default Pipes (Snowflake-managed, auto-created):
 --   MARKETS-STREAMING
+--   MARKET_EVENTS-STREAMING
 --   INGESTION_METRICS-STREAMING
 --
 -- Monitoring:
---   V_STREAMING_CHANNEL_HEALTH  - Channel errors, latency, row counts
+--   V_STREAMING_CHANNEL_HEALTH     - Channel errors, latency (ACCOUNT_USAGE, may have lag)
+--   V_STREAMING_OPERATIONAL_HEALTH - Real-time pipeline status per table
 --   SNOWPIPE_STREAMING_CHANNEL_HISTORY - Full account-usage history
 -- ============================================================
