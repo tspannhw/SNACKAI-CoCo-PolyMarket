@@ -232,6 +232,104 @@ def validate_fetch_and_transform() -> ValidationResult:
     return result
 
 
+def validate_metrics_client() -> ValidationResult:
+    """Validate metrics streaming client can be created."""
+    result = ValidationResult("Metrics Client")
+    start = time.time()
+
+    try:
+        from main import create_metrics_client
+
+        client = create_metrics_client('snowflake_config.json')
+
+        checks = [
+            client.database is not None,
+            client.schema is not None,
+            client.table == 'INGESTION_METRICS',
+            client.pipe == 'INGESTION_METRICS-STREAMING',
+            client.channel_name is not None and 'METRICS' in client.channel_name,
+        ]
+
+        result.duration_ms = (time.time() - start) * 1000
+
+        if all(checks):
+            result.passed = True
+            result.message = f"OK - table={client.table}, pipe={client.pipe}, channel={client.channel_name}"
+        else:
+            failed_details = []
+            if not checks[2]:
+                failed_details.append(f"table={client.table} (expected INGESTION_METRICS)")
+            if not checks[3]:
+                failed_details.append(f"pipe={client.pipe} (expected INGESTION_METRICS-STREAMING)")
+            result.message = f"Config mismatch: {', '.join(failed_details) or 'missing attributes'}"
+
+    except FileNotFoundError:
+        result.duration_ms = (time.time() - start) * 1000
+        result.skipped = True
+        result.message = "snowflake_config.json not found"
+    except Exception as e:
+        result.duration_ms = (time.time() - start) * 1000
+        result.message = f"Error: {e}"
+
+    return result
+
+
+def validate_metrics_row_format() -> ValidationResult:
+    """Validate that stream_ingestion_metrics produces a correct row."""
+    result = ValidationResult("Metrics Row Format")
+    start = time.time()
+
+    try:
+        from main import stream_ingestion_metrics
+        from unittest.mock import MagicMock
+
+        mock_client = MagicMock()
+        mock_client.offset_token = 0
+        mock_client.channel_name = "VALIDATION_TEST"
+
+        test_metrics = {
+            'batch_id': 'validation_test',
+            'markets_fetched': 50,
+            'markets_streamed': 50,
+            'events_streamed': 3,
+            'errors': 0,
+            'fetch_duration_ms': 1000.0,
+            'stream_duration_ms': 200.0,
+            'total_duration_ms': 1200.0,
+        }
+
+        stream_ingestion_metrics(mock_client, test_metrics)
+
+        result.duration_ms = (time.time() - start) * 1000
+
+        if mock_client.append_rows.called:
+            row = mock_client.append_rows.call_args[0][0][0]
+            required_keys = [
+                'metric_id', 'batch_id', 'batch_timestamp',
+                'markets_fetched', 'markets_streamed', 'events_streamed',
+                'fetch_duration_ms', 'stream_duration_ms', 'total_duration_ms',
+                'api_status_code', 'error_message', 'offset_token', 'channel_name',
+            ]
+            missing = [k for k in required_keys if k not in row]
+            if missing:
+                result.message = f"Missing keys in metrics row: {missing}"
+            elif row['batch_id'] != 'validation_test':
+                result.message = f"batch_id mismatch: {row['batch_id']}"
+            elif row['api_status_code'] != 200:
+                result.message = f"api_status_code should be 200, got {row['api_status_code']}"
+            else:
+                result.passed = True
+                result.message = f"OK - {len(required_keys)} fields validated, metric_id={row['metric_id']}"
+        else:
+            result.message = "append_rows was not called"
+
+    except Exception as e:
+        result.duration_ms = (time.time() - start) * 1000
+        result.message = f"Error: {e}"
+
+    return result
+
+
 def run_all_validations():
     """Run all validation checks."""
     print("=" * 60)
@@ -245,6 +343,8 @@ def run_all_validations():
         validate_data_transform,
         validate_config_file,
         validate_streaming_client,
+        validate_metrics_client,
+        validate_metrics_row_format,
         validate_fetch_and_transform,
     ]
 

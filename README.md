@@ -329,6 +329,70 @@ Throughput-based billing. See [Snowpipe Streaming costs](https://docs.snowflake.
 | `V_MARKET_VOLUME_SUMMARY` | Volume aggregated by category |
 | `V_INGESTION_HEALTH` | Streaming metrics by minute |
 
+### INGESTION_METRICS Table
+
+| Column | Type | Description |
+|--------|------|-------------|
+| metric_id | VARCHAR(100) | Unique metric row ID (`m_YYYYMMDD_HHMMSS_hex`) |
+| batch_id | VARCHAR(100) | Matches the batch in MARKETS table |
+| batch_timestamp | TIMESTAMP_NTZ | When the batch was processed |
+| markets_fetched | NUMBER | Markets returned from Polymarket API |
+| markets_streamed | NUMBER | Markets successfully streamed to Snowflake |
+| events_streamed | NUMBER | Events successfully streamed |
+| fetch_duration_ms | NUMBER | API fetch time in milliseconds |
+| stream_duration_ms | NUMBER | Snowflake streaming time in milliseconds |
+| total_duration_ms | NUMBER | Total batch processing time |
+| api_status_code | NUMBER | HTTP status code (200 = success) |
+| error_message | VARCHAR(4000) | Error details (NULL if no errors) |
+| offset_token | VARCHAR(255) | SSv2 offset token for exactly-once semantics |
+| channel_name | VARCHAR(255) | SSv2 channel name |
+
+### MARKET_EVENTS Table
+
+| Column | Type | Description |
+|--------|------|-------------|
+| event_id | VARCHAR(255) | Event ID from Polymarket |
+| event_title | VARCHAR(4000) | Event title text |
+| event_slug | VARCHAR(1000) | URL-safe event slug |
+| market_id | VARCHAR(255) | FK to MARKETS.id |
+| category | VARCHAR(255) | Category (mirrors market) |
+| end_date | TIMESTAMP_NTZ | Event end date |
+| ingested_at | TIMESTAMP_TZ | When streamed to Snowflake |
+| batch_id | VARCHAR(100) | Ingestion batch identifier |
+
+## Pipeline Status Monitoring
+
+The dashboard displays real-time pipeline health based on the `LAST_INGESTED` timestamp from `V_LATEST_MARKETS`:
+
+| Status | Indicator | Condition | Meaning |
+|--------|-----------|-----------|---------|
+| **Healthy** | Green pulsing dot | Last ingestion < 3 minutes ago | Streamer is running normally |
+| **Stale** | Yellow dot + warning banner | Last ingestion 3-10 minutes ago | Streamer may have stopped or is lagging |
+| **Offline** | Red dot + error banner | Last ingestion > 10 minutes ago or no data | Streamer is not running |
+
+When the pipeline is stale or offline, the dashboard shows a banner with instructions to start the streamer via `./manage.sh stream`.
+
+### Ingestion Metrics Flow
+
+Each streaming cycle in `main.py` produces one row in `INGESTION_METRICS`:
+
+```
+Polymarket API → fetch markets → transform → stream to MARKETS table
+                                           → compute metrics
+                                           → stream to INGESTION_METRICS table
+```
+
+The metrics are streamed via a **separate SSv2 client** (one channel per table is required by SSv2). The dashboard's `/api/streaming` route reads `V_INGESTION_HEALTH` to show batch history, throughput, and error rates.
+
+### Connection Recovery
+
+The dashboard's Snowflake connection (`lib/snowflake.ts`) includes automatic recovery:
+
+1. If a query fails with a connection error (network, socket, timeout, ECONNRESET)
+2. The cached connection is destroyed via `resetConnection()`
+3. A new connection is established and the query is retried once
+4. If the retry also fails, the error is returned to the caller
+
 ## API Endpoints (React Dashboard)
 
 | Endpoint | Method | Cache | Description |
@@ -341,7 +405,7 @@ Throughput-based billing. See [Snowpipe Streaming costs](https://docs.snowflake.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `limit` | 100 | Max markets to return (max 500) |
+| `limit` | 500 | Max markets to return (max 1000) |
 | `category` | — | Filter by category |
 | `active` | `true` | Filter active markets |
 
@@ -360,7 +424,7 @@ Throughput-based billing. See [Snowpipe Streaming costs](https://docs.snowflake.
 ### Continuous mode (default)
 
 ```bash
-python main.py --interval 60 --pages 5 --batch-size 50
+python main.py --interval 60 --pages 10 --batch-size 50
 ```
 
 ### Single run
@@ -376,13 +440,13 @@ python main.py --once --pages 3
 | `--config` | `snowflake_config.json` | Config file path |
 | `--once` | false | Single cycle then exit |
 | `--interval` | 60 | Seconds between cycles |
-| `--pages` | 5 | Max API pages per cycle |
+| `--pages` | 10 | Max API pages per cycle (100 markets/page) |
 | `--batch-size` | 50 | Rows per streaming batch |
 
 ## Testing
 
 ```bash
-# All tests
+# All tests (Python + Jest)
 ./manage.sh test
 
 # Python tests only
@@ -391,12 +455,48 @@ python -m pytest test_polymarket.py -v
 # Jest tests only
 npm test
 
-# Pipeline validation
+# Pipeline validation (7 checks)
 ./manage.sh validate
 
 # Polymarket API check
 ./manage.sh test-api
 ```
+
+### Test Coverage
+
+**Python tests** (`test_polymarket.py` — 19 tests):
+
+| Test Class | Tests | What It Covers |
+|------------|-------|----------------|
+| `TestPolymarketFetcher` | 4 | API fetch, pagination, error handling, data transform |
+| `TestDataTransform` | 3 | Market/event row building, safe_float/safe_bool helpers |
+| `TestDataIntegrity` | 6 | Required fields, edge cases, empty lists, deduplication |
+| `TestMetricsRow` | 3 | Metrics row structure, error rows, failure isolation |
+| `TestStreamingClient` | 3 | Client init, auth selection, row serialization |
+
+**Jest tests** (`__tests__/utils.test.ts` — 22 tests):
+
+| Suite | Tests | What It Covers |
+|-------|-------|----------------|
+| `parseOutcomes` | 5 | JSON parsing, malformed input, empty arrays |
+| `parseOutcomePrices` | 5 | Price arrays, non-numeric values, edge cases |
+| `formatVolume` | 5 | K/M/B suffixes, zero, negative, small values |
+| `formatPrice` | 2 | Percentage formatting, null handling |
+| `ExportRequestSchema` | 5 | Zod validation, required fields, format enum |
+
+### Pipeline Validation Checks
+
+Run via `./manage.sh validate` or `python validation.py`:
+
+| # | Check | What It Validates |
+|---|-------|-------------------|
+| 1 | `validate_polymarket_api` | Polymarket API is reachable and returns valid market data |
+| 2 | `validate_data_transform` | Market and event row transformations produce correct schema |
+| 3 | `validate_config_file` | `snowflake_config.json` exists with all required fields |
+| 4 | `validate_streaming_client` | SSv2 client initializes with correct table/pipe/channel |
+| 5 | `validate_metrics_client` | Metrics SSv2 client targets `INGESTION_METRICS` table |
+| 6 | `validate_metrics_row_format` | Metrics rows contain all 13 required fields |
+| 7 | `validate_fetch_and_transform` | End-to-end fetch → transform produces valid rows |
 
 ## Troubleshooting
 

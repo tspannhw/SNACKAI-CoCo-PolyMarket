@@ -204,6 +204,171 @@ class TestDataIntegrity:
         diff = abs((now - ingested).total_seconds())
         assert diff < 5  # within 5 seconds
 
+    def test_all_required_market_fields_present(self):
+        """Test that transform_market always produces all required columns."""
+        raw = {"id": "field-check", "question": "Test"}
+        result = PolymarketFetcher.transform_market(raw, "test-batch")
+
+        required_keys = [
+            'id', 'question', 'condition_id', 'slug', 'description',
+            'category', 'end_date', 'start_date', 'active', 'closed',
+            'volume', 'volume_num', 'volume_24hr', 'liquidity', 'liquidity_num',
+            'spread', 'outcomes', 'outcome_prices', 'ingested_at', 'batch_id',
+        ]
+        for key in required_keys:
+            assert key in result, f"Missing required key: {key}"
+
+    def test_all_required_event_fields_present(self):
+        """Test that transform_event always produces all required columns."""
+        raw = {"id": "evt-check", "title": "Test Event"}
+        result = PolymarketFetcher.transform_event(raw, "test-batch")
+
+        required_keys = [
+            'event_id', 'ticker', 'slug', 'title', 'description',
+            'category', 'volume', 'liquidity', 'market_count',
+            'ingested_at', 'batch_id',
+        ]
+        for key in required_keys:
+            assert key in result, f"Missing required key: {key}"
+
+    def test_safe_float_edge_cases(self):
+        """Test that string 'null', empty, and invalid values are handled."""
+        raw = {
+            "id": "edge-cases",
+            "question": "Test",
+            "volume": "null",
+            "volumeNum": "",
+            "liquidity": "not-a-number",
+            "score": "0",
+        }
+        result = PolymarketFetcher.transform_market(raw, "test")
+
+        assert result['volume'] is None       # "null" string -> None
+        assert result['volume_num'] is None   # empty string -> None
+        assert result['liquidity'] is None    # invalid string -> None
+        assert result['score'] == 0.0         # "0" -> 0.0
+
+    def test_safe_bool_edge_cases(self):
+        """Test boolean handling for various input types."""
+        # True values
+        raw_true = {"id": "bool-t", "question": "T", "active": "true"}
+        assert PolymarketFetcher.transform_market(raw_true, "t")['active'] is True
+
+        # False values
+        raw_false = {"id": "bool-f", "question": "F", "active": "false"}
+        assert PolymarketFetcher.transform_market(raw_false, "t")['active'] is False
+
+        # Native bool
+        raw_native = {"id": "bool-n", "question": "N", "active": True}
+        assert PolymarketFetcher.transform_market(raw_native, "t")['active'] is True
+
+    def test_empty_market_list_transform(self):
+        """Test fetch_and_transform handles empty API response gracefully."""
+        fetcher = PolymarketFetcher()
+        # Patch fetch_all_markets to return empty
+        with patch.object(fetcher, 'fetch_all_markets', return_value=[]):
+            markets, events, batch_id = fetcher.fetch_and_transform(max_pages=1)
+            assert markets == []
+            assert events == []
+            assert batch_id.startswith("batch_")
+
+    def test_duplicate_events_deduplicated(self):
+        """Test that duplicate events from different markets are deduplicated."""
+        fetcher = PolymarketFetcher()
+        shared_event = {"id": "evt-shared", "title": "Shared Event", "markets": [1, 2]}
+        raw_markets = [
+            {"id": "m1", "question": "Q1", "events": [shared_event]},
+            {"id": "m2", "question": "Q2", "events": [shared_event]},
+        ]
+        with patch.object(fetcher, 'fetch_all_markets', return_value=raw_markets):
+            markets, events, batch_id = fetcher.fetch_and_transform(max_pages=1)
+            assert len(markets) == 2
+            assert len(events) == 1  # deduped by event ID
+
+
+class TestMetricsRow:
+    """Tests for ingestion metrics row generation."""
+
+    def test_metrics_row_structure(self):
+        """Test that stream_ingestion_metrics builds a valid row."""
+        from main import stream_ingestion_metrics
+        from unittest.mock import MagicMock
+
+        mock_client = MagicMock()
+        mock_client.offset_token = 42
+        mock_client.channel_name = "TEST_CHANNEL"
+
+        metrics = {
+            'batch_id': 'batch_test_123',
+            'markets_fetched': 100,
+            'markets_streamed': 98,
+            'events_streamed': 5,
+            'errors': 0,
+            'fetch_duration_ms': 1500.0,
+            'stream_duration_ms': 300.0,
+            'total_duration_ms': 1800.0,
+        }
+
+        stream_ingestion_metrics(mock_client, metrics)
+
+        # Verify append_rows was called with one row
+        mock_client.append_rows.assert_called_once()
+        rows = mock_client.append_rows.call_args[0][0]
+        assert len(rows) == 1
+
+        row = rows[0]
+        assert row['batch_id'] == 'batch_test_123'
+        assert row['markets_fetched'] == 100
+        assert row['markets_streamed'] == 98
+        assert row['events_streamed'] == 5
+        assert row['api_status_code'] == 200
+        assert row['error_message'] is None
+        assert row['offset_token'] == 42
+        assert row['channel_name'] == "TEST_CHANNEL"
+        assert row['metric_id'].startswith("m_")
+        assert row['batch_timestamp'] is not None
+
+    def test_metrics_row_with_errors(self):
+        """Test metrics row when batch has errors."""
+        from main import stream_ingestion_metrics
+        from unittest.mock import MagicMock
+
+        mock_client = MagicMock()
+        mock_client.offset_token = 10
+        mock_client.channel_name = "ERR_CHANNEL"
+
+        metrics = {
+            'batch_id': 'batch_err',
+            'markets_fetched': 0,
+            'markets_streamed': 0,
+            'events_streamed': 0,
+            'errors': 3,
+            'fetch_duration_ms': 0,
+            'stream_duration_ms': 0,
+            'total_duration_ms': 100.0,
+        }
+
+        stream_ingestion_metrics(mock_client, metrics)
+
+        row = mock_client.append_rows.call_args[0][0][0]
+        assert row['api_status_code'] == 0
+        assert row['error_message'] == "3 error(s) in batch"
+
+    def test_metrics_stream_failure_does_not_raise(self):
+        """Test that metrics streaming failures are caught, not propagated."""
+        from main import stream_ingestion_metrics
+        from unittest.mock import MagicMock
+
+        mock_client = MagicMock()
+        mock_client.append_rows.side_effect = Exception("Network error")
+        mock_client.offset_token = 0
+        mock_client.channel_name = "FAIL_CHANNEL"
+
+        metrics = {'batch_id': 'test', 'markets_fetched': 10, 'errors': 0}
+
+        # Should not raise
+        stream_ingestion_metrics(mock_client, metrics)
+
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
